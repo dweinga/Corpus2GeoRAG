@@ -712,10 +712,19 @@ class MapTrashBinHook(MacroElement):
                 if (btn) {
                     btn.classList.remove("leaflet-disabled");
                 }
+                if (window.__GLOBAL_DATA__) {
+                    window.__GLOBAL_DATA__.lat_lng_clicked = e.latlng;
+                }
+                try {
+                    if (typeof updateComponentValue === "function") {
+                        updateComponentValue(map);
+                    }
+                } catch(err) {}
             });
 
             // Synchronize selection and maintain popup state when existing markers are clicked
             map.on('popupopen', function(e) {
+                if (window._reopeningPopup) return;
                 if (e.popup) {
                     var latlng = e.popup.getLatLng();
                     var source = e.popup._source;
@@ -741,6 +750,8 @@ class MapTrashBinHook(MacroElement):
             });
 
             if (window._lastOpenPopupInfo) {
+                var targetInfo = window._lastOpenPopupInfo;
+                window._lastOpenPopupInfo = null;
                 setTimeout(function() {
                     try {
                         window._reopeningPopup = true;
@@ -749,13 +760,13 @@ class MapTrashBinHook(MacroElement):
                                 var l_ll = l.getLatLng();
                                 var l_lat = Math.round(l_ll.lat * 100000) / 100000;
                                 var l_lng = Math.round(l_ll.lng * 100000) / 100000;
-                                if (Math.abs(l_lat - window._lastOpenPopupInfo.lat) < 0.0001 && Math.abs(l_lng - window._lastOpenPopupInfo.lng) < 0.0001) {
+                                if (Math.abs(l_lat - targetInfo.lat) < 0.0001 && Math.abs(l_lng - targetInfo.lng) < 0.0001) {
                                     l.openPopup();
                                 }
                             }
                         });
                     } catch(err) {} finally {
-                        setTimeout(function() { window._reopeningPopup = false; }, 100);
+                        setTimeout(function() { window._reopeningPopup = false; }, 200);
                     }
                 }, 120);
             }
@@ -802,6 +813,11 @@ class MapTrashBinHook(MacroElement):
                     if (btn) {
                         btn.classList.remove("leaflet-disabled");
                     }
+                    try {
+                        if (typeof updateComponentValue === "function") {
+                            updateComponentValue(map);
+                        }
+                    } catch(err) {}
                 }
             });
 
@@ -861,17 +877,29 @@ class MapTrashBinHook(MacroElement):
                 }
             }, true);
 
-            // Ensure the trash button is visually enabled if we have active selections or layers
-            var hasActive = {{ "true" if this.has_active else "false" }};
-            if (hasActive) {
-                setTimeout(function() {
-                    var btn = document.querySelector(".leaflet-draw-edit-remove");
-                    if (btn) {
+            // Dynamically synchronize the trash button state from live map feature groups and drawn items
+            function updateTrashButtonState() {
+                var hasActive = false;
+                if (typeof drawnItems !== 'undefined' && drawnItems.getLayers && drawnItems.getLayers().length > 0) {
+                    hasActive = true;
+                }
+                if (!hasActive && window.feature_group && window.feature_group.length > 0) {
+                    for (var i = 0; i < window.feature_group.length; i++) {
+                        if (window.feature_group[i] && window.feature_group[i].getLayers && window.feature_group[i].getLayers().length > 0) {
+                            hasActive = true;
+                            break;
+                        }
+                    }
+                }
+                var btn = document.querySelector(".leaflet-draw-edit-remove");
+                if (btn) {
+                    if (hasActive) {
                         btn.classList.remove("leaflet-disabled");
                         btn.setAttribute("title", "Remove active target selection or tactical overlays");
                     }
-                }, 100);
+                }
             }
+            setTimeout(updateTrashButtonState, 100);
 
             // ------------------------------------------------------------------
             // Bottom-Right Tactical Pin Filter Control
@@ -2852,14 +2880,7 @@ with col2:
     folium.LayerControl(position="topright").add_to(m)
 
     # Attach trash bin hook to integrate Leaflet Draw's trash icon with GeoAI selection removal
-    has_active_elements = bool(
-        st.session_state.get("selected_points")
-        or st.session_state.get("bounding_box")
-        or st.session_state.get("map_layers")
-    )
-    MapTrashBinHook(
-        has_active=has_active_elements
-    ).add_to(m)
+    MapTrashBinHook().add_to(m)
 
     # Render the interactive map component inside Streamlit
     # Uses returned_objects to ensure 0ms client-side pans and zooms with zero reruns (AGENTS.md Rule 1.1)
@@ -2933,6 +2954,10 @@ with col2:
                 (min(lats), min(lngs)),
                 (max(lats), max(lngs))
             )
+            needs_rerun = (
+                st.session_state.get("selection_mode") != "Bounding Box"
+                or st.session_state.get("bounding_box") != (lower_left, upper_right)
+            )
             st.session_state.selection_mode = "Bounding Box"
             st.session_state.selected_points = [lower_left, upper_right]
             st.session_state.bounding_box = (lower_left, upper_right)
@@ -2942,7 +2967,8 @@ with col2:
             if map_data and map_data.get("last_clicked"):
                 cd = map_data["last_clicked"]
                 st.session_state.last_clicked = (round(cd["lat"], 5), round(cd["lng"], 5))
-            st.rerun()
+            if needs_rerun:
+                st.rerun()
 
         elif gtype == "Point" and coords and len(coords) >= 2:
             st.session_state.last_processed_drawing = active_drawing

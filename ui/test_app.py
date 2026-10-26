@@ -951,6 +951,19 @@ class TestMapTrashBinTool:
         # The base map hash MUST NOT change, ensuring zero map reload / flash
         assert h_initial == h_with_point
 
+        # Ensure that has_active=False vs has_active=True also produces identical base map hashes
+        m_active = folium.Map(location=[48.3794, 31.1656], zoom_start=6, tiles=None)
+        folium.plugins.Draw(
+            export=False,
+            position="topleft",
+            draw_options={"rectangle": True},
+            edit_options={"edit": False, "remove": True}
+        ).add_to(m_active)
+        MapTrashBinHook(has_active=True).add_to(m_active)
+        s_active = _get_map_string(m_active)
+        h_active = generate_js_hash(s_active, key="geoai_tactical_map")
+        assert h_initial == h_active
+
     def test_instant_replacement_cleans_prior_selection(self):
         """Verify MapTrashBinHook includes client-side instant cleanup for prior selection replacing."""
         import folium
