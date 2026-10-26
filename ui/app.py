@@ -677,6 +677,12 @@ class MapTrashBinHook(MacroElement):
                 if (map._isDrawing) return;
                 if (e.originalEvent && (e.originalEvent._stopped || e.originalEvent.defaultPrevented)) return;
 
+                // Guard: Ignore clicks on existing markers, cluster icons, popups, or controls
+                var target = e.originalEvent && e.originalEvent.target;
+                if (target && target.closest && target.closest('.leaflet-marker-icon, .awesome-marker, .marker-cluster, .leaflet-popup, .leaflet-popup-content-wrapper, .leaflet-control')) {
+                    return;
+                }
+
                 var lat = Math.round(e.latlng.lat * 100000) / 100000;
                 var lng = Math.round(e.latlng.lng * 100000) / 100000;
 
@@ -707,6 +713,52 @@ class MapTrashBinHook(MacroElement):
                     btn.classList.remove("leaflet-disabled");
                 }
             });
+
+            // Synchronize selection and maintain popup state when existing markers are clicked
+            map.on('popupopen', function(e) {
+                if (e.popup) {
+                    var latlng = e.popup.getLatLng();
+                    var source = e.popup._source;
+                    if (latlng) {
+                        window._lastOpenPopupInfo = {
+                            lat: Math.round(latlng.lat * 100000) / 100000,
+                            lng: Math.round(latlng.lng * 100000) / 100000
+                        };
+                    }
+                    if (source && typeof source.toGeoJSON === 'function' && window.__GLOBAL_DATA__) {
+                        window.__GLOBAL_DATA__.last_active_drawing = source.toGeoJSON();
+                        if (typeof debouncedUpdateComponentValue === 'function') {
+                            debouncedUpdateComponentValue(map);
+                        }
+                    }
+                }
+            });
+
+            map.on('popupclose', function(e) {
+                if (!window._reopeningPopup) {
+                    window._lastOpenPopupInfo = null;
+                }
+            });
+
+            if (window._lastOpenPopupInfo) {
+                setTimeout(function() {
+                    try {
+                        window._reopeningPopup = true;
+                        map.eachLayer(function(l) {
+                            if (l instanceof L.Marker && l.getLatLng && l.getPopup) {
+                                var l_ll = l.getLatLng();
+                                var l_lat = Math.round(l_ll.lat * 100000) / 100000;
+                                var l_lng = Math.round(l_ll.lng * 100000) / 100000;
+                                if (Math.abs(l_lat - window._lastOpenPopupInfo.lat) < 0.0001 && Math.abs(l_lng - window._lastOpenPopupInfo.lng) < 0.0001) {
+                                    l.openPopup();
+                                }
+                            }
+                        });
+                    } catch(err) {} finally {
+                        setTimeout(function() { window._reopeningPopup = false; }, 100);
+                    }
+                }, 120);
+            }
 
             // 2. Instant client-side feedback when an AOI Rectangle is drawn
             map.on('draw:created', function(e) {
@@ -1591,7 +1643,12 @@ if _early_map_state and isinstance(_early_map_state, dict):
                 st.session_state.map_layers = []
             st.session_state.last_drawing_time = time.time()
 
-    elif _early_all_drawings == [] and (st.session_state.get("selected_points") or st.session_state.get("bounding_box")) and not _early_drawing:
+    elif (
+        _early_all_drawings == []
+        and st.session_state.get("selection_mode") == "Bounding Box"
+        and st.session_state.get("bounding_box")
+        and not _early_drawing
+    ):
         _has_sel = bool(st.session_state.get("selected_points") or st.session_state.get("bounding_box"))
         clear_spatial_selection()
         if not _has_sel and st.session_state.get("map_layers"):
@@ -1621,11 +1678,12 @@ if _early_map_state and isinstance(_early_map_state, dict):
             st.session_state.last_processed_drawing = _early_drawing
             st.session_state.ignored_drawing = None
             _pt = (round(float(_coords[1]), 5), round(float(_coords[0]), 5))
-            st.session_state.selection_mode = "Point Selection"
-            st.session_state.selected_points = [_pt]
-            st.session_state.bounding_box = None
-            st.session_state.active_point = _pt
-            st.session_state.last_drawing_time = time.time()
+            if st.session_state.selected_points != [_pt]:
+                st.session_state.selection_mode = "Point Selection"
+                st.session_state.selected_points = [_pt]
+                st.session_state.bounding_box = None
+                st.session_state.active_point = _pt
+                st.session_state.last_drawing_time = time.time()
             if _early_clicked:
                 st.session_state.last_clicked = _pt
 
@@ -1637,10 +1695,11 @@ if _early_map_state and isinstance(_early_map_state, dict):
             st.session_state.last_clicked = _c_pt
         elif _c_pt != st.session_state.last_clicked:
             st.session_state.last_clicked = _c_pt
-            st.session_state.selection_mode = "Point Selection"
-            st.session_state.selected_points = [_c_pt]
-            st.session_state.bounding_box = None
-            st.session_state.active_point = _c_pt
+            if st.session_state.selected_points != [_c_pt]:
+                st.session_state.selection_mode = "Point Selection"
+                st.session_state.selected_points = [_c_pt]
+                st.session_state.bounding_box = None
+                st.session_state.active_point = _c_pt
 
 # ==============================================================================
 # 3. Sidebar Utility Controls & Intelligence Dashboard
@@ -2836,11 +2895,12 @@ with col2:
             st.session_state.last_drawing_time = time.time()
             st.rerun()
 
-    # Also detect when all_drawings becomes empty while spatial selections were active
+    # Also detect when all_drawings becomes empty while a bounding box was drawn
     if (
         not st.session_state.get("pending_query")
         and all_drawings == []
-        and (st.session_state.get("selected_points") or st.session_state.get("bounding_box"))
+        and st.session_state.get("selection_mode") == "Bounding Box"
+        and st.session_state.get("bounding_box")
         and not active_drawing
     ):
         has_selection = bool(st.session_state.get("selected_points") or st.session_state.get("bounding_box"))
@@ -2891,6 +2951,7 @@ with col2:
             lat = round(float(coords[1]), 5)
             lng = round(float(coords[0]), 5)
             pt = (lat, lng)
+            needs_rerun = st.session_state.selected_points != [pt]
             st.session_state.selection_mode = "Point Selection"
             st.session_state.selected_points = [pt]
             st.session_state.bounding_box = None
@@ -2898,7 +2959,8 @@ with col2:
             st.session_state.last_drawing_time = time.time()
             if map_data and map_data.get("last_clicked"):
                 st.session_state.last_clicked = pt
-            st.rerun()
+            if needs_rerun:
+                st.rerun()
 
     # --------------------------------------------------------------------------
     # 2. Click Interception (Selection ONLY - NO immediate backend call)
@@ -2918,12 +2980,13 @@ with col2:
         elif clicked_coord != st.session_state.last_clicked:
             st.session_state.last_clicked = clicked_coord
 
-            # Direct map click selects/replaces target point
-            st.session_state.selection_mode = "Point Selection"
-            st.session_state.selected_points = [clicked_coord]
-            st.session_state.bounding_box = None
-            st.session_state.active_point = clicked_coord
-            st.rerun()
+            # Direct map click selects/replaces target point only if changed
+            if st.session_state.selected_points != [clicked_coord]:
+                st.session_state.selection_mode = "Point Selection"
+                st.session_state.selected_points = [clicked_coord]
+                st.session_state.bounding_box = None
+                st.session_state.active_point = clicked_coord
+                st.rerun()
 
 
 # ------------------------------------------------------------------------------

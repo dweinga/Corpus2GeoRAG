@@ -988,6 +988,36 @@ class TestMapTrashBinTool:
         assert "tactical_layers_fg = folium.FeatureGroup(name=\"Tactical Overlays\", control=False)" in content
         assert "feature_group_to_add=[selection_fg, tactical_layers_fg]" in content
 
+    def test_existing_marker_click_protection_and_popup_sync(self):
+        """Verify MapTrashBinHook ignores clicks on existing markers and synchronizes popup selection."""
+        import folium
+        from streamlit_folium import _get_map_string
+        import app
+
+        MapTrashBinHook = getattr(app, "MapTrashBinHook")
+        m = folium.Map()
+        MapTrashBinHook().add_to(m)
+
+        script = _get_map_string(m)
+
+        # 1. Guard against clicks on existing markers and popups
+        assert ".leaflet-marker-icon" in script
+        assert ".marker-cluster" in script
+        assert ".leaflet-popup" in script
+
+        # 2. Popup open synchronization hook
+        assert "map.on('popupopen'" in script
+        assert "last_active_drawing = source.toGeoJSON()" in script
+        assert "window._lastOpenPopupInfo" in script
+
+    def test_point_selection_not_cleared_by_empty_all_drawings(self):
+        """Ensure Point Selection is not inadvertently cleared when all_drawings is empty."""
+        with open("app.py", "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Both Section 2b and Section 6 must guard all_drawings == [] with selection_mode == 'Bounding Box'
+        assert "st.session_state.get(\"selection_mode\") == \"Bounding Box\"" in content
+
 
 class TestRAGDebugLogging:
     """Validate RAG agent debug logging, telemetry, payload reconstruction, and error recording."""
