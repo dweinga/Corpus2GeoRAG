@@ -1310,4 +1310,189 @@ class TestUpgradesOneThroughSixAndPerformance:
         )
 
 
+class TestTacticalHudSymbologyAndAnsweredBbox:
+    """Validate Tactical HUD map symbology, pin factories, popup cards, and answered bbox transparency."""
+
+    def test_color_token_semantic_resolution(self):
+        """Ensure color_token resolves roles and legacy color names across dark and light themes."""
+        import app
+
+        # Primary (blue / primary role)
+        tok_dark, hex_dark = app.color_token("blue", role="primary", theme="dark")
+        assert tok_dark == "primary"
+        assert hex_dark == "#38bdf8"
+        tok_light, hex_light = app.color_token("blue", role="primary", theme="light")
+        assert tok_light == "primary"
+        assert hex_light == "#0369a1"
+
+        # Event (red / event kind)
+        ev_tok, ev_hex = app.color_token("red", kind="event", theme="dark")
+        assert ev_tok == "event"
+        assert ev_hex == "#ff4d6d"
+
+        # Uncertain (orange / uncertain flag)
+        unc_tok, unc_hex = app.color_token("orange", uncertain=True, theme="dark")
+        assert unc_tok == "uncertain"
+        assert unc_hex == "#ffb020"
+
+        # Context (cadetblue / context role)
+        ctx_tok, ctx_hex = app.color_token("cadetblue", role="context", theme="dark")
+        assert ctx_tok == "context"
+        assert ctx_hex == "#7dd3fc"
+
+        # Query BBox
+        bbox_tok, bbox_hex = app.color_token("orange", role="query_bbox", theme="dark")
+        assert bbox_tok == "selection"
+        assert bbox_hex == "#00e5ff"
+
+    def test_bbox_style_selected_vs_answered_transparency(self):
+        """Ensure answered bounding boxes become ultra-transparent and non-interactive."""
+        import app
+
+        sel = app.bbox_style("selected", theme="dark")
+        ans = app.bbox_style("answered", theme="dark")
+
+        # Selected bbox has higher opacity and is interactive
+        assert sel["fill_opacity"] == 0.10
+        assert sel["opacity"] == 0.90
+        assert sel["weight"] == 2
+        assert sel["dash_array"] == "6, 6"
+        assert sel["interactive"] is True
+        assert "geoai-bbox--selected" in sel["class_name"]
+
+        # Answered bbox is ultra-transparent (fill_opacity=0.03), faint stroke, and non-interactive
+        assert ans["fill_opacity"] == 0.03
+        assert ans["opacity"] == 0.55
+        assert ans["weight"] == 1.25
+        assert ans["dash_array"] == "3, 6"
+        assert ans["interactive"] is False
+        assert "geoai-bbox--answered" in ans["class_name"]
+        assert ans["fill_opacity"] < sel["fill_opacity"]
+
+    def test_make_pin_icon_variants(self):
+        """Verify make_pin_icon generates pure CSS DivIcons for target, corners, context, and diamonds."""
+        import app
+
+        # 1. Target reticle
+        reticle = app.make_pin_icon(role="target")
+        assert reticle.options["icon_size"] == [34, 34] or reticle.options["icon_size"] == (34, 34)
+        assert "geoai-reticle" in reticle.options["html"]
+        assert "geoai-reticle__pulse" in reticle.options["html"]
+
+        # 2. BBox corner brackets (active and dimmed)
+        sw_corner = app.make_pin_icon(role="bbox_corner", corner="sw", dimmed=False)
+        assert "geoai-corner--sw" in sw_corner.options["html"]
+        assert "geoai-corner--dim" not in sw_corner.options["html"]
+
+        ne_dim = app.make_pin_icon(role="bbox_corner", corner="ne", dimmed=True)
+        assert "geoai-corner--ne" in ne_dim.options["html"]
+        assert "geoai-corner--dim" in ne_dim.options["html"]
+
+        # 3. Context dot
+        ctx_icon = app.make_pin_icon(role="context", color_name="cadetblue")
+        assert "geoai-dot" in ctx_icon.options["html"]
+        assert "geoai-pin--context" in ctx_icon.options["class_name"]
+        assert "awesome-marker-icon-cadetblue" in ctx_icon.options["class_name"]
+
+        # 4. Primary numbered diamond
+        prim_icon = app.make_pin_icon(role="primary", number=3, color_name="blue")
+        assert "geoai-diamond" in prim_icon.options["html"]
+        assert "<span>3</span>" in prim_icon.options["html"]
+        assert "geoai-pin--primary" in prim_icon.options["class_name"]
+
+        # 5. Event diamond
+        ev_icon = app.make_pin_icon(kind="event", role="primary", color_name="red")
+        assert "geoai-diamond" in ev_icon.options["html"]
+        assert "<span>!</span>" in ev_icon.options["html"]
+        assert "geoai-pin--event" in ev_icon.options["class_name"]
+
+        # 6. Uncertain diamond with dashed border and ? badge
+        unc_icon = app.make_pin_icon(role="primary", uncertain=True, number=2, color_name="orange")
+        assert "geoai-diamond--uncertain" in unc_icon.options["html"]
+        assert "geoai-badge-unc" in unc_icon.options["html"]
+        assert "<span>2</span>" in unc_icon.options["html"]
+        assert "geoai-pin--uncertain" in unc_icon.options["class_name"]
+        assert "awesome-marker-icon-orange" in unc_icon.options["class_name"]
+
+    def test_popup_card_html_generation(self):
+        """Verify _popup_card builds structured dark-glass HUD markup."""
+        import app
+
+        html = app._popup_card(
+            title="Kharkiv Sector",
+            rows=[("LAT", "49.9935"), ("LON", "36.2304"), ("ROLE", "primary")],
+            chip="[1] PLACE",
+            footer="<div>[1] Intel Report</div>",
+            token="primary",
+        )
+        assert "geoai-card" in html
+        assert "Kharkiv Sector" in html
+        assert "[1] PLACE" in html
+        assert "49.9935" in html
+        assert "36.2304" in html
+        assert "[1] Intel Report" in html
+
+    def test_geo_agent_bbox_layers_include_query_bbox_and_corner_roles(self):
+        """Ensure query_geo_agent tags bbox polygons with role='query_bbox' and corners with 'bbox_corner'."""
+        import geo_agent
+
+        bbox = ((48.0, 31.0), (49.5, 33.5))
+        resp = geo_agent.query_geo_agent(
+            text_prompt="Analyze sector",
+            bounding_box=bbox,
+            force_mock=True
+        )
+        poly_layers = [l for l in resp.layers if l.layer_type == "polygon"]
+        assert len(poly_layers) >= 1
+        assert poly_layers[0].data.get("role") == "query_bbox"
+
+        corner_layers = [
+            l for l in resp.layers
+            if l.layer_type == "marker" and isinstance(l.data, dict) and l.data.get("role") == "bbox_corner"
+        ]
+        assert len(corner_layers) == 2
+        corners = {l.data.get("corner") for l in corner_layers}
+        assert corners == {"sw", "ne"}
+
+    def test_client_side_hooks_support_new_hud_symbology_and_answered_bbox(self):
+        """Verify MapTrashBinHook includes PinFilterControl, .geoai-pin classes, and answered bbox sync."""
+        import folium
+        from streamlit_folium import _get_map_string
+        import app
+
+        m = folium.Map()
+        app.MapTrashBinHook().add_to(m)
+
+        script = _get_map_string(m)
+        assert "function geoaiIcon(opts)" in script
+        assert "syncAnsweredBboxInDrawnItems" in script
+        assert "geoai-bbox--answered" in script
+        assert "geoai-pin--context" in script
+        assert "geoai-pin--uncertain" in script
+        assert "PinFilterControl" in script
+
+    def test_instant_hud_bridge_and_popup_auto_open(self):
+        """Verify 0ms client-side selection bridge and target point popup auto-open."""
+        with open("app.py", "r", encoding="utf-8") as f:
+            content = f.read()
+
+        assert "_geoaiSelectionBridgeInstalled" in content
+        assert "GEOAI_SELECTION_EVENT" in content
+        assert "geoai-instant-pill-slot" in content
+        assert "popup=folium.Popup(popup_html, max_width=250, show=True)" in content
+
+    def test_streamlined_zero_widget_sources_drawer(self):
+        """Verify Verified Sources uses native HTML details cards to prevent widget tree explosion."""
+        with open("app.py", "r", encoding="utf-8") as f:
+            content = f.read()
+
+        assert "geoai-source-detail" in content
+        assert "geoai-source-summary" in content
+        assert "geoai-source-badge" in content
+        assert "btn_src_" not in content
+
+
+
+
+
 
