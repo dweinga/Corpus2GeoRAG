@@ -1131,19 +1131,21 @@ class TestRAGDebugLogging:
         assert "Simulated connection timeout" in log["error_details"]["message"]
 
     def test_sidebar_operations_order_in_codebase(self):
-        """Verify that Operations appears before Spatial Targeting and contains RAG Debug Logs button."""
+        """Verify Operations contains RAG Debug Logs and retain pins toggle, and redundant Spatial Targeting is removed."""
         with open("app.py", "r", encoding="utf-8") as f:
             code = f.read()
 
         ops_pos = code.find("st.subheader(\"🛠️ Operations\")")
         spatial_pos = code.find("st.subheader(\"🎯 Spatial Targeting\")")
         rag_btn_pos = code.find("📋 RAG Debug Logs")
+        keep_pts_pos = code.find("Retain target pin after query")
 
         assert ops_pos != -1, "Operations section must exist in sidebar"
-        assert spatial_pos != -1, "Spatial Targeting section must exist in sidebar"
+        assert spatial_pos == -1, "Redundant Spatial Targeting section should not exist in sidebar"
         assert rag_btn_pos != -1, "RAG Debug Logs button must exist"
-        assert ops_pos < spatial_pos, "Operations section must be positioned ABOVE Spatial Targeting"
-        assert ops_pos < rag_btn_pos < spatial_pos, "RAG Debug Logs button must be inside Operations section"
+        assert keep_pts_pos != -1, "Retain target pin toggle must exist in Operations"
+        assert ops_pos < rag_btn_pos, "RAG Debug Logs button must be inside Operations section"
+        assert ops_pos < keep_pts_pos, "Retain target pin toggle must be inside Operations section"
 
     def test_chat_bubbles_opposite_sides_layout(self):
         """Ensure chat console styles operator (user) on the right and geo-ai on the left with bubble styling."""
@@ -1491,8 +1493,98 @@ class TestTacticalHudSymbologyAndAnsweredBbox:
         assert "geoai-source-badge" in content
         assert "btn_src_" not in content
 
+    def test_corner_bracket_exact_vertex_anchors(self):
+        """Verify corner bracket DivIcons anchor at exact SVG L-vertices so brackets align with marching ants."""
+        import app
 
+        expected_anchors = {
+            "nw": [2, 2],
+            "ne": [14, 2],
+            "se": [14, 14],
+            "sw": [2, 14],
+        }
+        for corner, expected in expected_anchors.items():
+            icon = app.make_pin_icon(role="bbox_corner", corner=corner)
+            assert list(icon.options["icon_size"]) == [16, 16]
+            assert list(icon.options["icon_anchor"]) == expected
 
+    def test_pin_shape_diamond_vs_teardrop(self):
+        """Verify make_pin_icon supports switching between Diamond and Teardrop shapes."""
+        import app
 
+        diamond_icon = app.make_pin_icon(role="primary", number=1, color_name="blue", shape="diamond")
+        assert "geoai-diamond" in diamond_icon.options["html"]
+        assert "geoai-teardrop" not in diamond_icon.options["html"]
+        assert "geoai-pin--teardrop" not in diamond_icon.options["class_name"]
+        assert list(diamond_icon.options["icon_anchor"]) == [11, 11]
 
+        teardrop_icon = app.make_pin_icon(role="primary", number=1, color_name="blue", shape="teardrop")
+        assert "geoai-diamond geoai-teardrop" in teardrop_icon.options["html"]
+        assert "geoai-pin--teardrop" in teardrop_icon.options["class_name"]
+        assert list(teardrop_icon.options["icon_anchor"]) == [11, 11]
 
+    def test_querying_bbox_style_and_scanline_hook(self):
+        """Verify bbox_style('querying') and client-side scanline/pulse animation hooks."""
+        import folium
+        from streamlit_folium import _get_map_string
+        import app
+
+        q_style = app.bbox_style("querying", theme="dark")
+        assert q_style["fill_opacity"] == 0.08
+        assert q_style["opacity"] == 0.95
+        assert "geoai-bbox--querying" in q_style["class_name"]
+
+        m = folium.Map()
+        app.MapTrashBinHook().add_to(m)
+        script = _get_map_string(m)
+        assert "startQueryingAnimation" in script
+        assert "stopQueryingAnimation" in script
+        assert "geoai-scan-svg" in script
+        assert "geoai-scan-line" in script
+        assert "geoai-reticle--querying" in script
+        assert "setMapPinShape" in script
+
+    def test_selection_sync_hook_and_clear_spatial_selection(self):
+        """Verify SelectionSyncHook emits _onServerSelectionSync in feature_group_string and clear_spatial_selection increments clear_seq."""
+        import folium
+        import streamlit as st
+        from streamlit_folium import _get_feature_group_string, _get_map_string
+        import app
+
+        m1 = folium.Map(location=[48.3794, 31.1656], zoom_start=6)
+        m2 = folium.Map(location=[48.3794, 31.1656], zoom_start=6)
+        base_map_str_1 = _get_map_string(m1)
+        base_map_str_2 = _get_map_string(m2)
+
+        fg = folium.FeatureGroup(name="Active Selection", control=False)
+        app.SelectionSyncHook(
+            has_selection=False,
+            clear_seq=3,
+            bbox_state="none",
+            is_querying=False,
+            bbox_bounds=None,
+            pin_shape="Teardrop",
+        ).add_to(fg)
+
+        fg_str = _get_feature_group_string(fg, m2, 0)
+
+        # Base map string is untouched before feature_group rendering while feature_group_string carries the sync call
+        assert base_map_str_1 == base_map_str_2
+        assert "_onServerSelectionSync" in fg_str
+        assert "clearSeq: 3" in fg_str
+        assert 'pinShape: "teardrop"' in fg_str
+
+        # Verify clear_spatial_selection increments selection_clear_seq and records stale map widget state
+        st.session_state.selected_points = [(50.45, 30.52)]
+        st.session_state.bounding_box = ((49.0, 30.0), (50.0, 31.0))
+        st.session_state.selection_clear_seq = 0
+        st.session_state["geoai_tactical_map"] = {
+            "last_clicked": {"lat": 50.45, "lng": 30.52},
+            "last_active_drawing": {"geometry": {"type": "Polygon", "coordinates": [[[30.0, 49.0], [31.0, 50.0]]]}},
+        }
+        app.clear_spatial_selection()
+        assert st.session_state.selected_points == []
+        assert st.session_state.bounding_box is None
+        assert st.session_state.selection_clear_seq == 1
+        assert st.session_state.last_clicked == (50.45, 30.52)
+        assert st.session_state.ignored_drawing is not None

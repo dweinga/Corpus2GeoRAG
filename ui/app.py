@@ -171,6 +171,15 @@ def dispatch_geo_query(
     timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     t_start = time.perf_counter()
 
+    _query_hud_slot = st.empty()
+    try:
+        _query_hud_slot.markdown(
+            "<script>(function(){try{var fs=window.parent.document.querySelectorAll('iframe');for(var i=0;i<fs.length;i++){if(fs[i].contentWindow)fs[i].contentWindow.postMessage({type:'GEOAI_QUERY_STATE',state:'querying'},'*');}}catch(e){}})();</script>",
+            unsafe_allow_html=True,
+        )
+    except Exception:
+        pass
+
     try:
         with st.spinner("🛰️ Querying GeoRAG Agent..."):
             agent_resp: AgentResponse = query_geo_agent(
@@ -217,6 +226,10 @@ def dispatch_geo_query(
                 "error_details": None
             }
             _append_rag_log(log_entry)
+            try:
+                _query_hud_slot.empty()
+            except Exception:
+                pass
             return agent_resp
     except AgentError as err:
         latency_ms = round((time.perf_counter() - t_start) * 1000, 1)
@@ -516,9 +529,59 @@ def clear_spatial_selection():
     st.session_state.active_point = None
     st.session_state.selection_mode = "Point Selection"
     st.session_state.last_drawing_time = time.time()
+    st.session_state.selection_clear_seq = st.session_state.get("selection_clear_seq", 0) + 1
     if st.session_state.get("last_processed_drawing"):
         st.session_state.ignored_drawing = st.session_state.get("last_processed_drawing")
+    _cur_map = st.session_state.get("geoai_tactical_map")
+    if isinstance(_cur_map, dict):
+        if _cur_map.get("last_active_drawing"):
+            st.session_state.ignored_drawing = _cur_map.get("last_active_drawing")
+        _lc = _cur_map.get("last_clicked")
+        if isinstance(_lc, dict) and "lat" in _lc and "lng" in _lc:
+            st.session_state.last_clicked = (round(_lc["lat"], 5), round(_lc["lng"], 5))
     st.session_state.last_processed_drawing = None
+
+
+class SelectionSyncHook(MacroElement):
+    """
+    Lightweight MacroElement attached to `selection_fg` (feature_group_0) so that whenever
+    Streamlit updates `feature_group_to_add` (without reloading the base map iframe):
+    1. Any temporary client-side instant preview layers (`drawnItems`, `_instantTargetMarker`,
+       `_instantBboxLayers`) are purged so server-rendered layers never duplicate or linger
+       after clicking Clear.
+    2. Active pin shape ('diamond' vs 'teardrop') and querying scanline state are synchronized.
+    """
+    _template = Template("""
+        {% macro script(this, kwargs) %}
+        if (typeof window._onServerSelectionSync === 'function') {
+            window._onServerSelectionSync({
+                hasSelection: {{ 'true' if this.has_selection else 'false' }},
+                clearSeq: {{ this.clear_seq }},
+                bboxState: "{{ this.bbox_state }}",
+                isQuerying: {{ 'true' if this.is_querying else 'false' }},
+                bboxBounds: {{ this.bbox_bounds_js }},
+                pinShape: "{{ this.pin_shape }}"
+            });
+        }
+        {% endmacro %}
+    """)
+
+    def __init__(
+        self,
+        has_selection: bool = False,
+        clear_seq: int = 0,
+        bbox_state: str = "selected",
+        is_querying: bool = False,
+        bbox_bounds: Optional[List[List[float]]] = None,
+        pin_shape: str = "diamond",
+    ):
+        super().__init__()
+        self.has_selection = bool(has_selection)
+        self.clear_seq = int(clear_seq)
+        self.bbox_state = bbox_state
+        self.is_querying = bool(is_querying)
+        self.bbox_bounds_js = json.dumps(bbox_bounds) if bbox_bounds else "null"
+        self.pin_shape = (pin_shape or "diamond").strip().lower()
 
 
 class MapTrashBinHook(MacroElement):
@@ -530,13 +593,21 @@ class MapTrashBinHook(MacroElement):
        so clicking the garbage can icon directly clears the active spatial selection or tactical overlays.
     4. Fires Leaflet's `draw:deleted` event and updates Streamlit component state.
     5. Automatically transitions client-side drawn rectangles to the ultra-transparent answered style
-       when a query response bounding box is added to the map.
+       when a query response bounding box is added to the map, and renders the pulsing fill + sweeping
+       scanline during active agent queries.
     """
     _template = Template("""
         {% macro script(this, kwargs) %}
         (function() {
             var map = {{ this._parent.get_name() }};
             if (!map) return;
+
+            if (typeof drawnItems !== 'undefined') {
+                window.drawnItems = drawnItems;
+            }
+            window._instantBboxLayers = window._instantBboxLayers || [];
+            window._scanOverlay = window._scanOverlay || null;
+            window._lastClearSeq = window._lastClearSeq || 0;
 
             // ------------------------------------------------------------------
             // Client-side Tactical HUD DivIcon Factory (0ms instant previews)
@@ -547,6 +618,7 @@ class MapTrashBinHook(MacroElement):
                 if (role === 'target') {
                     var html = "<div class='geoai-reticle'>" +
                         "<i class='geoai-reticle__pulse'></i>" +
+                        "<i class='geoai-reticle__spin'></i>" +
                         "<svg width='34' height='34' viewBox='0 0 34 34'>" +
                         "<circle cx='17' cy='17' r='10' fill='none' stroke='currentColor' stroke-width='2'/>" +
                         "<path d='M17 1v8M17 25v8M1 17h8M25 17h8' stroke='currentColor' stroke-width='2'/>" +
@@ -568,7 +640,14 @@ class MapTrashBinHook(MacroElement):
                         se: 'M14,2 V14 H2',
                         sw: 'M14,14 H2 V2'
                     };
+                    var anchors = {
+                        nw: [2, 2],
+                        ne: [14, 2],
+                        se: [14, 14],
+                        sw: [2, 14]
+                    };
                     var dPath = paths[cDir] || paths.sw;
+                    var cAnchor = anchors[cDir] || [2, 14];
                     var dimCls = opts.dimmed ? ' geoai-corner--dim' : '';
                     var cHtml = "<div class='geoai-corner geoai-corner--" + cDir + dimCls + "'>" +
                         "<svg width='16' height='16' viewBox='0 0 16 16'>" +
@@ -577,7 +656,7 @@ class MapTrashBinHook(MacroElement):
                     return L.divIcon({
                         html: cHtml,
                         iconSize: [16, 16],
-                        iconAnchor: [8, 8],
+                        iconAnchor: cAnchor,
                         popupAnchor: [0, -8],
                         className: 'geoai-pin geoai-pin--corner geoai-pin--corner-' + cDir + ' awesome-marker-icon-red'
                     });
@@ -588,6 +667,99 @@ class MapTrashBinHook(MacroElement):
                     iconAnchor: [5, 5],
                     className: 'geoai-pin geoai-pin--context awesome-marker-icon-cadetblue'
                 });
+            }
+
+            // ------------------------------------------------------------------
+            // Querying State Animation (Pulsing Fill + Sweeping Scan Line)
+            // ------------------------------------------------------------------
+            function stopQueryingAnimation() {
+                if (window._scanOverlay) {
+                    try { map.removeLayer(window._scanOverlay); } catch (e) {}
+                    window._scanOverlay = null;
+                }
+                try {
+                    var c = map.getContainer();
+                    if (c) {
+                        var qPaths = c.querySelectorAll('.geoai-bbox--querying');
+                        for (var i = 0; i < qPaths.length; i++) {
+                            qPaths[i].classList.remove('geoai-bbox--querying');
+                        }
+                        var qRets = c.querySelectorAll('.geoai-reticle--querying');
+                        for (var j = 0; j < qRets.length; j++) {
+                            qRets[j].classList.remove('geoai-reticle--querying');
+                        }
+                    }
+                } catch (e) {}
+            }
+
+            function startQueryingAnimation(boundsOverride) {
+                stopQueryingAnimation();
+                try {
+                    var c = map.getContainer();
+                    if (c) {
+                        var rets = c.querySelectorAll('.geoai-reticle');
+                        for (var r = 0; r < rets.length; r++) {
+                            rets[r].classList.add('geoai-reticle--querying');
+                        }
+                    }
+                    var targetBounds = boundsOverride || null;
+                    map.eachLayer(function(l) {
+                        if (l && l.getBounds && l._path) {
+                            var cls = ((l.options && l.options.className) || '') + ' ' + (l._path.getAttribute('class') || '');
+                            if (cls.indexOf('geoai-bbox--selected') !== -1 || cls.indexOf('geoai-bbox--querying') !== -1) {
+                                l._path.classList.add('geoai-bbox--querying');
+                                if (!targetBounds) {
+                                    targetBounds = l.getBounds();
+                                }
+                            }
+                        }
+                    });
+                    if (targetBounds && typeof L.svgOverlay === 'function') {
+                        var svgEl = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+                        svgEl.setAttribute('viewBox', '0 0 100 100');
+                        svgEl.setAttribute('preserveAspectRatio', 'none');
+                        svgEl.setAttribute('class', 'geoai-scan-svg');
+                        svgEl.innerHTML =
+                            "<defs><linearGradient id='geoai-scan-grad' x1='0%' y1='0%' x2='100%' y2='0%'>" +
+                            "<stop offset='0%' stop-color='#00e5ff' stop-opacity='0'/>" +
+                            "<stop offset='50%' stop-color='#00e5ff' stop-opacity='0.28'/>" +
+                            "<stop offset='100%' stop-color='#00e5ff' stop-opacity='0'/>" +
+                            "</linearGradient></defs>" +
+                            "<rect class='geoai-scan-band' x='-8' y='0' width='16' height='100'>" +
+                            "<animate attributeName='x' values='-8;92;-8' dur='2.4s' repeatCount='indefinite'/>" +
+                            "</rect>" +
+                            "<line class='geoai-scan-line' x1='0' y1='0' x2='0' y2='100'>" +
+                            "<animate attributeName='x1' values='0;100;0' dur='2.4s' repeatCount='indefinite'/>" +
+                            "<animate attributeName='x2' values='0;100;0' dur='2.4s' repeatCount='indefinite'/>" +
+                            "</line>";
+                        window._scanOverlay = L.svgOverlay(svgEl, targetBounds, { interactive: false }).addTo(map);
+                    }
+                } catch (e) {
+                    console.warn('[GeoAI] startQueryingAnimation error:', e);
+                }
+            }
+
+            function setMapPinShape(shape) {
+                var container = map.getContainer();
+                if (!container) return;
+                var s = (shape || 'diamond').toLowerCase();
+                window._geoaiPinShape = s;
+                if (s === 'teardrop') {
+                    container.classList.add('geoai-shape-teardrop');
+                } else {
+                    container.classList.remove('geoai-shape-teardrop');
+                }
+                var btnDia = document.getElementById('geoai_shape_btn_diamond');
+                var btnTear = document.getElementById('geoai_shape_btn_teardrop');
+                if (btnDia && btnTear) {
+                    if (s === 'teardrop') {
+                        btnTear.classList.add('active');
+                        btnDia.classList.remove('active');
+                    } else {
+                        btnDia.classList.add('active');
+                        btnTear.classList.remove('active');
+                    }
+                }
             }
 
             // ------------------------------------------------------------------
@@ -653,16 +825,37 @@ class MapTrashBinHook(MacroElement):
                 {% endfor %}
             }
 
-            // Function to instantly remove any active selection from the map DOM (0ms latency)
-            function clearPreviousSelectionInstantly() {
-                // 1. Clear Leaflet Draw items
+            function clearInstantPreviewOnly() {
                 try {
                     if (window.drawnItems && typeof window.drawnItems.clearLayers === 'function') {
                         window.drawnItems.clearLayers();
                     }
+                    if (typeof drawnItems !== 'undefined' && drawnItems && typeof drawnItems.clearLayers === 'function') {
+                        drawnItems.clearLayers();
+                    }
                 } catch(e) {}
 
-                // 2. Clear client-side instant target marker
+                if (window._instantTargetMarker) {
+                    try { map.removeLayer(window._instantTargetMarker); } catch(err) {}
+                    window._instantTargetMarker = null;
+                }
+
+                if (window._instantBboxLayers && window._instantBboxLayers.length > 0) {
+                    for (var i = 0; i < window._instantBboxLayers.length; i++) {
+                        try { map.removeLayer(window._instantBboxLayers[i]); } catch(err) {}
+                    }
+                    window._instantBboxLayers = [];
+                }
+            }
+
+            // Function to instantly remove any active selection from the map DOM (0ms latency)
+            function clearPreviousSelectionInstantly() {
+                stopQueryingAnimation();
+
+                // 1. Clear Leaflet Draw items & client-side instant previews
+                clearInstantPreviewOnly();
+
+                // 2. Clear client-side instant target marker (explicitly kept for test assertions)
                 if (window._instantTargetMarker) {
                     try { map.removeLayer(window._instantTargetMarker); } catch(err) {}
                     window._instantTargetMarker = null;
@@ -682,26 +875,58 @@ class MapTrashBinHook(MacroElement):
                 } catch(e) {}
 
                 // 4. Scan all layers on the map and immediately purge any prior target or bbox layers
+                var tacFg = (window.feature_group && window.feature_group.length > 1) ? window.feature_group[1] : null;
+                function isSelectionLayer(layer) {
+                    if (!layer) return false;
+                    if (tacFg && typeof tacFg.hasLayer === 'function' && tacFg.hasLayer(layer)) {
+                        return false;
+                    }
+                    if (layer._icon && typeof layer._icon.className === 'string') {
+                        var ic = layer._icon.className;
+                        if (ic.indexOf('geoai-pin--target') !== -1) return true;
+                        if (ic.indexOf('geoai-pin--corner') !== -1) {
+                            var innerCorner = layer._icon.querySelector && layer._icon.querySelector('.geoai-corner--dim');
+                            if (!innerCorner) return true;
+                        }
+                    }
+                    if (layer.options && typeof layer.options.className === 'string') {
+                        if (layer.options.className.indexOf('geoai-bbox--selected') !== -1 ||
+                            layer.options.className.indexOf('geoai-bbox--querying') !== -1) {
+                            return true;
+                        }
+                    }
+                    if (layer._path && layer._path.classList) {
+                        if (layer._path.classList.contains('geoai-bbox--selected') ||
+                            layer._path.classList.contains('geoai-bbox--querying')) {
+                            return true;
+                        }
+                    }
+                    var tt = layer.getTooltip && layer.getTooltip();
+                    var ttContent = tt ? (tt.getContent ? tt.getContent() : tt._content) : "";
+                    if (typeof ttContent === "string" && (
+                        ttContent.indexOf("★ Target Point") !== -1 ||
+                        ttContent.indexOf("★ Bounding Box") !== -1 ||
+                        ttContent.indexOf("★ BBOX") !== -1
+                    )) {
+                        return true;
+                    }
+                    var pop = layer.getPopup && layer.getPopup();
+                    var popContent = pop ? (pop.getContent ? pop.getContent() : pop._content) : "";
+                    if (typeof popContent === "string" && (
+                        popContent.indexOf("★ TARGET POINT") !== -1 ||
+                        popContent.indexOf("★ BBOX") !== -1 ||
+                        popContent.indexOf("★ TWO-POINT BOUNDING BOX") !== -1
+                    )) {
+                        return true;
+                    }
+                    return false;
+                }
+
                 try {
                     map.eachLayer(function(layer) {
                         try {
-                            var tt = layer.getTooltip && layer.getTooltip();
-                            var ttContent = tt ? (tt.getContent ? tt.getContent() : tt._content) : "";
-                            if (typeof ttContent === "string" && (
-                                ttContent.indexOf("★ Target Point") !== -1 ||
-                                ttContent.indexOf("★ Bounding Box") !== -1 ||
-                                ttContent.indexOf("★ BBOX") !== -1
-                            )) {
-                                map.removeLayer(layer);
-                                return;
-                            }
-                            var pop = layer.getPopup && layer.getPopup();
-                            var popContent = pop ? (pop.getContent ? pop.getContent() : pop._content) : "";
-                            if (typeof popContent === "string" && (
-                                popContent.indexOf("★ TARGET POINT") !== -1 ||
-                                popContent.indexOf("★ BBOX") !== -1 ||
-                                popContent.indexOf("★ TWO-POINT BOUNDING BOX") !== -1
-                            )) {
+                            if (layer === tacFg) return;
+                            if (isSelectionLayer(layer)) {
                                 map.removeLayer(layer);
                                 return;
                             }
@@ -709,13 +934,7 @@ class MapTrashBinHook(MacroElement):
                                 var toRemove = [];
                                 layer.eachLayer(function(subLayer) {
                                     try {
-                                        var s_tt = subLayer.getTooltip && subLayer.getTooltip();
-                                        var s_ttc = s_tt ? (s_tt.getContent ? s_tt.getContent() : s_tt._content) : "";
-                                        if (typeof s_ttc === "string" && (
-                                            s_ttc.indexOf("★ Target Point") !== -1 ||
-                                            s_ttc.indexOf("★ Bounding Box") !== -1 ||
-                                            s_ttc.indexOf("★ BBOX") !== -1
-                                        )) {
+                                        if (isSelectionLayer(subLayer)) {
                                             toRemove.push(subLayer);
                                         }
                                     } catch(err2) {}
@@ -729,6 +948,62 @@ class MapTrashBinHook(MacroElement):
                     });
                 } catch(e) {}
             }
+
+            // Server-to-Client Selection Synchronization Hook (invoked by SelectionSyncHook on selection_fg)
+            window._onServerSelectionSync = function(state) {
+                state = state || {};
+                if (state.pinShape) {
+                    setMapPinShape(state.pinShape);
+                }
+                // Always clear temporary client-side preview layers once selection_fg has mounted from Python
+                clearInstantPreviewOnly();
+
+                if (!state.hasSelection) {
+                    clearPreviousSelectionInstantly();
+                    if (window.__GLOBAL_DATA__) {
+                        window.__GLOBAL_DATA__.lat_lng_clicked = null;
+                        window.__GLOBAL_DATA__.last_active_drawing = null;
+                        window.__GLOBAL_DATA__.all_drawings = [];
+                    }
+                    try {
+                        window.parent.postMessage({
+                            type: 'GEOAI_SELECTION_EVENT',
+                            action: 'clear'
+                        }, '*');
+                    } catch(err) {}
+                } else if (state.isQuerying) {
+                    setTimeout(function() {
+                        startQueryingAnimation(state.bboxBounds);
+                    }, 30);
+                } else {
+                    stopQueryingAnimation();
+                }
+                setTimeout(updateTrashButtonState, 50);
+            };
+
+            // Listen for parent window messages (querying state, instant clear button, pin shape)
+            window.addEventListener('message', function(ev) {
+                if (!ev || !ev.data) return;
+                if (ev.data.type === 'GEOAI_QUERY_STATE') {
+                    if (ev.data.state === 'querying') {
+                        startQueryingAnimation();
+                    } else {
+                        stopQueryingAnimation();
+                    }
+                } else if (ev.data.type === 'GEOAI_PARENT_CMD' && ev.data.action === 'clear') {
+                    triggerRemoval();
+                } else if (ev.data.type === 'GEOAI_PARENT_CMD' && ev.data.action === 'clear_visuals') {
+                    clearPreviousSelectionInstantly();
+                    if (window.__GLOBAL_DATA__) {
+                        window.__GLOBAL_DATA__.lat_lng_clicked = null;
+                        window.__GLOBAL_DATA__.last_active_drawing = null;
+                        window.__GLOBAL_DATA__.all_drawings = [];
+                    }
+                    updateTrashButtonState();
+                } else if (ev.data.type === 'GEOAI_PIN_SHAPE' && ev.data.shape) {
+                    setMapPinShape(ev.data.shape);
+                }
+            });
 
             // 1. Instant client-side visual feedback on map canvas clicks (0ms latency)
             map.on('click', function(e) {
@@ -868,16 +1143,20 @@ class MapTrashBinHook(MacroElement):
                 if (e.layerType === 'rectangle') {
                     var rect = e.layer;
                     var bounds = rect.getBounds();
-                    var sw = bounds.getSouthWest();
-                    var ne = bounds.getNorthEast();
+                    var rawSW = bounds.getSouthWest();
+                    var rawNE = bounds.getNorthEast();
+                    var swLat = Math.round(Math.min(rawSW.lat, rawNE.lat) * 100000) / 100000;
+                    var swLng = Math.round(Math.min(rawSW.lng, rawNE.lng) * 100000) / 100000;
+                    var neLat = Math.round(Math.max(rawSW.lat, rawNE.lat) * 100000) / 100000;
+                    var neLng = Math.round(Math.max(rawSW.lng, rawNE.lng) * 100000) / 100000;
 
                     // Send 0ms instant selection event to parent window HUD
                     try {
                         window.parent.postMessage({
                             type: 'GEOAI_SELECTION_EVENT',
                             action: 'set_bbox',
-                            sw: [Math.round(sw.lat * 100000) / 100000, Math.round(sw.lng * 100000) / 100000],
-                            ne: [Math.round(ne.lat * 100000) / 100000, Math.round(ne.lng * 100000) / 100000]
+                            sw: [swLat, swLng],
+                            ne: [neLat, neLng]
                         }, '*');
                     } catch(err) {}
 
@@ -885,6 +1164,9 @@ class MapTrashBinHook(MacroElement):
                     clearPreviousSelectionInstantly();
 
                     try {
+                        if (rect.setBounds) {
+                            rect.setBounds([[swLat, swLng], [neLat, neLng]]);
+                        }
                         if (rect.setStyle) {
                             rect.setStyle({
                                 color: '#00e5ff',
@@ -896,17 +1178,25 @@ class MapTrashBinHook(MacroElement):
                                 className: 'geoai-bbox geoai-bbox--selected'
                             });
                         }
+                        if (window.drawnItems) {
+                            window.drawnItems.addLayer(rect);
+                        } else {
+                            rect.addTo(map);
+                        }
+                        if (rect._path) {
+                            rect._path.classList.add('geoai-bbox', 'geoai-bbox--selected');
+                        }
                         var iconDown = geoaiIcon({ role: 'bbox_corner', corner: 'sw', icon: 'arrow-down' });
                         var iconUp = geoaiIcon({ role: 'bbox_corner', corner: 'ne', icon: 'arrow-up' });
                         var iconNW = geoaiIcon({ role: 'bbox_corner', corner: 'nw' });
                         var iconSE = geoaiIcon({ role: 'bbox_corner', corner: 'se' });
 
-                        var mSW = L.marker([sw.lat, sw.lng], { icon: iconDown })
-                            .bindTooltip("★ Bounding Box Lower-Left (SW): " + sw.lat.toFixed(4) + "°, " + sw.lng.toFixed(4) + "°");
-                        var mNE = L.marker([ne.lat, ne.lng], { icon: iconUp })
-                            .bindTooltip("★ Bounding Box Upper-Right (NE): " + ne.lat.toFixed(4) + "°, " + ne.lng.toFixed(4) + "°");
-                        var mNW = L.marker([ne.lat, sw.lng], { icon: iconNW, interactive: false });
-                        var mSE = L.marker([sw.lat, ne.lng], { icon: iconSE, interactive: false });
+                        var mSW = L.marker([swLat, swLng], { icon: iconDown })
+                            .bindTooltip("★ Bounding Box Lower-Left (SW): " + swLat.toFixed(4) + "°, " + swLng.toFixed(4) + "°");
+                        var mNE = L.marker([neLat, neLng], { icon: iconUp })
+                            .bindTooltip("★ Bounding Box Upper-Right (NE): " + neLat.toFixed(4) + "°, " + neLng.toFixed(4) + "°");
+                        var mNW = L.marker([neLat, swLng], { icon: iconNW, interactive: false });
+                        var mSE = L.marker([swLat, neLng], { icon: iconSE, interactive: false });
 
                         if (window.drawnItems) {
                             window.drawnItems.addLayer(mSW);
@@ -919,6 +1209,7 @@ class MapTrashBinHook(MacroElement):
                             mNW.addTo(map);
                             mSE.addTo(map);
                         }
+                        window._instantBboxLayers = [rect, mSW, mNE, mNW, mSE];
                     } catch(err) {
                         console.warn("[GeoAI] Instant bbox markers error:", err);
                     }
@@ -937,7 +1228,6 @@ class MapTrashBinHook(MacroElement):
 
             // 3. Automatically dim client-side drawnItems rectangle when an answered bbox arrives
             function syncAnsweredBboxInDrawnItems() {
-                if (!window.drawnItems || typeof window.drawnItems.eachLayer !== 'function') return;
                 var hasAnsweredOnMap = false;
                 map.eachLayer(function(l) {
                     if (l && l.options && typeof l.options.className === 'string' && l.options.className.indexOf('geoai-bbox--answered') !== -1) {
@@ -945,6 +1235,8 @@ class MapTrashBinHook(MacroElement):
                     }
                 });
                 if (!hasAnsweredOnMap) return;
+                stopQueryingAnimation();
+                if (!window.drawnItems || typeof window.drawnItems.eachLayer !== 'function') return;
                 window.drawnItems.eachLayer(function(dl) {
                     if (dl && typeof dl.setStyle === 'function') {
                         dl.setStyle({
@@ -957,7 +1249,7 @@ class MapTrashBinHook(MacroElement):
                         });
                         if (dl._path) {
                             dl._path.style.pointerEvents = 'none';
-                            dl._path.classList.remove('geoai-bbox--selected');
+                            dl._path.classList.remove('geoai-bbox--selected', 'geoai-bbox--querying');
                             dl._path.classList.add('geoai-bbox--answered');
                         }
                     } else if (dl instanceof L.Marker && dl._icon && dl._icon.className && dl._icon.className.indexOf('geoai-pin--corner') !== -1) {
@@ -989,6 +1281,7 @@ class MapTrashBinHook(MacroElement):
                 if (window.__GLOBAL_DATA__) {
                     window.__GLOBAL_DATA__.all_drawings = [];
                     window.__GLOBAL_DATA__.last_active_drawing = delPayload;
+                    window.__GLOBAL_DATA__.lat_lng_clicked = null;
                 }
 
                 try {
@@ -1049,13 +1342,15 @@ class MapTrashBinHook(MacroElement):
                     if (hasActive) {
                         btn.classList.remove("leaflet-disabled");
                         btn.setAttribute("title", "Remove active target selection or tactical overlays");
+                    } else {
+                        btn.classList.add("leaflet-disabled");
                     }
                 }
             }
             setTimeout(updateTrashButtonState, 100);
 
             // ------------------------------------------------------------------
-            // Bottom-Right Tactical Pin Filter Control
+            // Bottom-Right Tactical Pin Filter & Shape Control (0ms Client-Side)
             // ------------------------------------------------------------------
             var PinFilterControl = L.Control.extend({
                 options: {
@@ -1067,12 +1362,35 @@ class MapTrashBinHook(MacroElement):
 
                     var toggle = L.DomUtil.create('a', 'leaflet-control-layers-toggle leaflet-control-pin-filter-toggle', container);
                     toggle.href = '#';
-                    toggle.title = 'Filter Tactical Pins';
+                    toggle.title = 'Pin Shape & Visibility Filters';
 
                     var section = L.DomUtil.create('section', 'leaflet-control-layers-list leaflet-control-pin-filter-list', container);
                     var overlays = L.DomUtil.create('div', 'leaflet-control-layers-overlays', section);
 
+                    var shapeHeader = L.DomUtil.create('div', 'pin-filter-header', overlays);
+                    shapeHeader.innerHTML = '◆ <b>PIN SHAPE</b>';
+
+                    var shapeRow = L.DomUtil.create('div', 'geoai-shape-seg', overlays);
+                    var btnDia = L.DomUtil.create('button', 'geoai-shape-btn active', shapeRow);
+                    btnDia.type = 'button';
+                    btnDia.id = 'geoai_shape_btn_diamond';
+                    btnDia.textContent = '◆ Diamond';
+                    var btnTear = L.DomUtil.create('button', 'geoai-shape-btn', shapeRow);
+                    btnTear.type = 'button';
+                    btnTear.id = 'geoai_shape_btn_teardrop';
+                    btnTear.textContent = '💧 Teardrop';
+
+                    btnDia.addEventListener('click', function(ev) {
+                        ev.preventDefault();
+                        setMapPinShape('diamond');
+                    });
+                    btnTear.addEventListener('click', function(ev) {
+                        ev.preventDefault();
+                        setMapPinShape('teardrop');
+                    });
+
                     var header = L.DomUtil.create('div', 'pin-filter-header', overlays);
+                    header.style.marginTop = '8px';
                     header.innerHTML = '📍 <b>PIN FILTERS</b>';
 
                     // Context pins toggle
@@ -1320,9 +1638,11 @@ def color_token(
 
 def bbox_style(state: str = "selected", theme: str = "dark") -> Dict[str, Any]:
     """
-    Return Leaflet path style kwargs for a bounding box in 'selected' or 'answered' state.
-    Answered bounding boxes are ultra-transparent (fill_opacity=0.03) and non-interactive
-    so result pins and basemap labels remain completely clear and clickable.
+    Return Leaflet path style kwargs for a bounding box in 'selected', 'querying', or 'answered' state.
+    - 'selected': 2px cyan dashed outline at 10% fill with animated marching ants.
+    - 'querying': 2px cyan dashed outline with gentle fill pulse (8% -> 20%) and sweeping scan line.
+    - 'answered': ultra-transparent (fill_opacity=0.03) and non-interactive so result pins and
+      basemap labels remain completely clear and clickable.
     """
     _, sel_hex = color_token("cyan", layer_type="rectangle", role="query_bbox", theme=theme)
     if state == "answered":
@@ -1336,6 +1656,18 @@ def bbox_style(state: str = "selected", theme: str = "dark") -> Dict[str, Any]:
             "fill_opacity": 0.03,
             "interactive": False,
             "class_name": "geoai-bbox geoai-bbox--answered",
+        }
+    if state == "querying":
+        return {
+            "color": sel_hex,
+            "weight": 2,
+            "opacity": 0.95,
+            "dash_array": "6, 6",
+            "fill": True,
+            "fill_color": sel_hex,
+            "fill_opacity": 0.08,
+            "interactive": False,
+            "class_name": "geoai-bbox geoai-bbox--selected geoai-bbox--querying",
         }
     return {
         "color": sel_hex,
@@ -1358,18 +1690,22 @@ def make_pin_icon(
     color_name: Optional[str] = None,
     corner: Optional[str] = None,
     dimmed: bool = False,
+    shape: Optional[str] = None,
 ) -> folium.DivIcon:
     """
     Build a lightweight, pure-CSS Tactical HUD folium.DivIcon for map markers:
-    - role == 'target': pulsing 34px crosshair reticle
+    - role == 'target': pulsing 34px crosshair reticle (with outer spin ring during queries)
     - role == 'bbox_corner' or corner in ('sw','ne','nw','se'): 16px L-shaped corner bracket
+      anchored directly at the exact corner vertex so brackets and marching ants align pixel-for-pixel
     - role == 'context': 8px solid dot with dark halo (0 image/shadow overhead for 500-1,600 pins)
-    - primary / event / uncertain / mock: 22px rotated-square diamond with number or symbol badge
+    - primary / event / uncertain / mock: switchable between 'diamond' (22px rotated square)
+      and 'teardrop' (24px classic teardrop pin) with number or symbol badge
     """
     if role == "target":
         html = (
             "<div class='geoai-reticle'>"
             "<i class='geoai-reticle__pulse'></i>"
+            "<i class='geoai-reticle__spin'></i>"
             "<svg width='34' height='34' viewBox='0 0 34 34'>"
             "<circle cx='17' cy='17' r='10' fill='none' stroke='currentColor' stroke-width='2'/>"
             "<path d='M17 1v8M17 25v8M1 17h8M25 17h8' stroke='currentColor' stroke-width='2'/>"
@@ -1394,7 +1730,14 @@ def make_pin_icon(
             "se": "M14,2 V14 H2",
             "sw": "M14,14 H2 V2",
         }
+        anchors = {
+            "nw": (2, 2),
+            "ne": (14, 2),
+            "se": (14, 14),
+            "sw": (2, 14),
+        }
         d_path = paths.get(c_dir, paths["sw"])
+        c_anchor = anchors.get(c_dir, (2, 14))
         html = (
             f"<div class='geoai-corner geoai-corner--{c_dir}{dim_cls}'>"
             f"<svg width='16' height='16' viewBox='0 0 16 16'>"
@@ -1404,7 +1747,7 @@ def make_pin_icon(
         return folium.DivIcon(
             html=html,
             icon_size=(16, 16),
-            icon_anchor=(8, 8),
+            icon_anchor=c_anchor,
             popup_anchor=(0, -8),
             class_name=f"geoai-pin geoai-pin--corner geoai-pin--corner-{c_dir} awesome-marker-icon-red",
         )
@@ -1430,7 +1773,16 @@ def make_pin_icon(
     else:
         label_str = "•"
 
+    resolved_shape = (
+        shape
+        or (st.session_state.get("pin_shape", "Diamond") if hasattr(st, "session_state") else "Diamond")
+        or "Diamond"
+    ).strip().lower()
+    is_teardrop = (resolved_shape == "teardrop")
+
     unc_cls = " geoai-diamond--uncertain" if is_unc else ""
+    shape_inner_cls = " geoai-teardrop" if is_teardrop else ""
+    shape_outer_cls = " geoai-pin--teardrop" if is_teardrop else " geoai-pin--diamond"
     badge_html = "<i class='geoai-badge-unc'>?</i>" if is_unc else ""
     legacy_cls = (
         "awesome-marker-icon-orange"
@@ -1440,7 +1792,7 @@ def make_pin_icon(
     role_cls = "geoai-pin--uncertain" if is_unc else f"geoai-pin--{tok}"
 
     html = (
-        f"<div class='geoai-diamond{unc_cls}' style='--c:var(--geoai-{tok});'>"
+        f"<div class='geoai-diamond{shape_inner_cls}{unc_cls}' style='--c:var(--geoai-{tok});'>"
         f"<span>{label_str}</span>"
         f"</div>{badge_html}"
     )
@@ -1448,8 +1800,8 @@ def make_pin_icon(
         html=html,
         icon_size=(22, 22),
         icon_anchor=(11, 11),
-        popup_anchor=(0, -14),
-        class_name=f"geoai-pin {role_cls} {legacy_cls}",
+        popup_anchor=(0, -28 if is_teardrop else -14),
+        class_name=f"geoai-pin{shape_outer_cls} {role_cls} {legacy_cls}",
     )
 
 
@@ -2024,6 +2376,71 @@ st.markdown("""
     if (window._geoaiSelectionBridgeInstalled) return;
     window._geoaiSelectionBridgeInstalled = true;
 
+    function postToMapIframes(payload) {
+        try {
+            var iframes = document.querySelectorAll('iframe');
+            for (var i = 0; i < iframes.length; i++) {
+                if (iframes[i].contentWindow) {
+                    iframes[i].contentWindow.postMessage(payload, '*');
+                }
+            }
+        } catch (err) {}
+    }
+
+    // 0ms Parent-to-Iframe Event Forwarding (Clear buttons, Chat Submit, Recon Scan)
+    document.addEventListener('click', function(e) {
+        var target = e.target;
+        if (!target || !target.closest) return;
+
+        // 1. Instant preview pill Clear button
+        var instClr = target.closest('[data-geoai-action="clear"]');
+        if (instClr) {
+            var slot = document.getElementById('geoai-instant-pill-slot');
+            if (slot) {
+                slot.style.display = 'none';
+                slot.innerHTML = '';
+            }
+            postToMapIframes({ type: 'GEOAI_PARENT_CMD', action: 'clear' });
+            return;
+        }
+
+        // 2. Streamlit Clear / Reset buttons -> 0ms visual cleanup in map iframe
+        var btn = target.closest('button');
+        if (btn) {
+            var txt = (btn.textContent || '').trim();
+            if (
+                txt.indexOf('❌ Clear') !== -1 ||
+                txt.indexOf('Clear Box') !== -1 ||
+                txt.indexOf('Clear Point') !== -1 ||
+                txt.indexOf('Reset Map Layers') !== -1
+            ) {
+                var slot2 = document.getElementById('geoai-instant-pill-slot');
+                if (slot2) {
+                    slot2.style.display = 'none';
+                    slot2.innerHTML = '';
+                }
+                postToMapIframes({ type: 'GEOAI_PARENT_CMD', action: 'clear_visuals' });
+                return;
+            }
+            // 3. Recon Scan or Chat Submit button -> 0ms querying scanline + pulse
+            if (
+                txt.indexOf('Recon') !== -1 ||
+                btn.getAttribute('data-testid') === 'stChatInputSubmitButton'
+            ) {
+                postToMapIframes({ type: 'GEOAI_QUERY_STATE', state: 'querying' });
+            }
+        }
+    }, true);
+
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            var ta = e.target && e.target.closest && e.target.closest('div[data-testid="stChatInput"] textarea');
+            if (ta && ta.value && ta.value.trim().length > 0) {
+                postToMapIframes({ type: 'GEOAI_QUERY_STATE', state: 'querying' });
+            }
+        }
+    }, true);
+
     window.addEventListener('message', function(event) {
         if (!event.data || event.data.type !== 'GEOAI_SELECTION_EVENT') return;
         var data = event.data;
@@ -2061,7 +2478,7 @@ st.markdown("""
         if (pillHtml) {
             slot.innerHTML = "<div class='geoai-instant-pill-row'>" +
                              "<div class='geoai-instant-pill-col-left'>" + pillHtml + "</div>" +
-                             "<div class='geoai-instant-pill-col-mid'><div class='geoai-instant-btn'>❌ Clear</div></div>" +
+                             "<div class='geoai-instant-pill-col-mid'><div class='geoai-instant-btn' data-geoai-action='clear' style='cursor:pointer;'>❌ Clear</div></div>" +
                              "<div class='geoai-instant-pill-col-right'><div class='geoai-instant-btn'>🔍 Recon</div></div>" +
                              "</div>";
             slot.style.display = 'block';
@@ -2173,6 +2590,14 @@ if "last_map_bbox" not in st.session_state:
 if "answered_bbox" not in st.session_state:
     # Tracks a bounding box that has already received a query response so it renders ultra-transparent
     st.session_state.answered_bbox = None
+
+if "pin_shape" not in st.session_state or st.session_state.pin_shape not in ["Diamond", "Teardrop"]:
+    # Primary/Event/Uncertain marker shape: 'Diamond' (default) or 'Teardrop'
+    st.session_state.pin_shape = "Diamond"
+
+if "selection_clear_seq" not in st.session_state:
+    # Monotonic counter incremented when selection is cleared to guarantee client-side sync
+    st.session_state.selection_clear_seq = 0
 
 # ==============================================================================
 # 2b. Early Map Event Ingestion (Pre-render state synchronization)
@@ -2296,6 +2721,20 @@ with st.sidebar:
         help="Numbers in brackets show where each statement comes from: [3] is pin 3 on the map; [S2] and [L1] are paragraphs from the source articles."
     )
 
+    st.radio(
+        "Pin shape",
+        options=["Diamond", "Teardrop"],
+        horizontal=True,
+        key="pin_shape",
+        help="Switch map pin shape between Tactical Diamond (◆) and Classic Teardrop (💧). Also toggleable directly on the map's bottom-right Pin Control."
+    )
+
+    st.toggle(
+        "Retain target pin after query",
+        key="keep_points",
+        help="Keep the active target pin or bounding box selected after sending a query (instead of clearing it)."
+    )
+
     rag_logs_count = len(st.session_state.get("rag_logs", []))
     if st.button(
         f"📋 RAG Debug Logs ({rag_logs_count})",
@@ -2357,131 +2796,6 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # Display active spatial targeting status and management
-    st.subheader("🎯 Spatial Targeting")
-
-    # If Bounding Box is active (from drawing a rectangle)
-    if st.session_state.get("bounding_box") is not None:
-        ll, ur = st.session_state.bounding_box
-        st.markdown(
-            f"<div class='geo-badge'>📦 Bounding Box (AOI) Active</div>",
-            unsafe_allow_html=True
-        )
-        col_ll1, col_ll2 = st.columns([3, 1])
-        with col_ll1:
-            st.markdown(f"**Lower-Left (SW):** `{ll[0]:.4f}°, {ll[1]:.4f}°`")
-        with col_ll2:
-            if st.button("❌", key="btn_remove_ll", help="Remove Lower-Left corner"):
-                st.session_state.selected_points = [ur]
-                st.session_state.bounding_box = None
-                st.session_state.answered_bbox = None
-                st.session_state.active_point = ur
-                st.session_state.selection_mode = "Point Selection"
-                st.rerun()
-
-        col_ur1, col_ur2 = st.columns([3, 1])
-        with col_ur1:
-            st.markdown(f"**Upper-Right (NE):** `{ur[0]:.4f}°, {ur[1]:.4f}°`")
-        with col_ur2:
-            if st.button("❌", key="btn_remove_ur", help="Remove Upper-Right corner"):
-                st.session_state.selected_points = [ll]
-                st.session_state.bounding_box = None
-                st.session_state.answered_bbox = None
-                st.session_state.active_point = ll
-                st.session_state.selection_mode = "Point Selection"
-                st.rerun()
-
-        lat_span = abs(ur[0] - ll[0])
-        lng_span = abs(ur[1] - ll[1])
-        st.caption(f"Area Span: ΔLat: `{lat_span:.4f}°` | ΔLng: `{lng_span:.4f}°`")
-        st.caption("Type a prompt in the chat to analyze this bounded area.")
-
-        col_b1, col_b2 = st.columns(2)
-        with col_b1:
-            if st.button("🗑️ Clear Box", use_container_width=True, help="Remove bounding box selection"):
-                clear_spatial_selection()
-                st.rerun()
-        with col_b2:
-            if st.button("🔍 Recon Scan", use_container_width=True, help="Run reconnaissance scan on bounding box"):
-                recon_response = dispatch_geo_query(
-                    text_prompt=None,
-                    selected_point=None,
-                    bounding_box=st.session_state.bounding_box
-                )
-                if recon_response:
-                    st.session_state.messages.append({
-                        "role": "user",
-                        "content": f"Reconnaissance requested for bounding box: Lower-Left ({ll[0]:.4f}°, {ll[1]:.4f}°), Upper-Right ({ur[0]:.4f}°, {ur[1]:.4f}°)"
-                    })
-                    st.session_state.messages.append(_build_assistant_message(recon_response))
-                    st.session_state.map_layers.extend(recon_response.layers)
-                    st.session_state.answered_bbox = st.session_state.bounding_box
-                    if getattr(recon_response, "map_bbox", None):
-                        st.session_state.last_map_bbox = recon_response.map_bbox
-                    if not st.session_state.get("keep_points", False):
-                        clear_spatial_selection()
-                    st.rerun()
-
-        st.checkbox("Keep points selected after sending prompt", key="keep_points")
-
-    # If single Point is active (from clicking the map)
-    elif st.session_state.get("selected_points"):
-        plat, plng = st.session_state.selected_points[0]
-        st.markdown(
-            f"<div class='geo-badge'>📍 1 Target Point Selected</div>",
-            unsafe_allow_html=True
-        )
-        col_p1, col_p2 = st.columns([3, 1])
-        with col_p1:
-            st.markdown(f"**Point:** `{plat:.4f}°, {plng:.4f}°`")
-        with col_p2:
-            if st.button("❌", key="btn_remove_single_pt", help="Remove selected point"):
-                clear_spatial_selection()
-                st.rerun()
-
-        st.caption("Click another location on the map to replace this selection, or enter a prompt below to analyze it.")
-
-        col_b1, col_b2 = st.columns(2)
-        with col_b1:
-            if st.button("🗑️ Clear Point", use_container_width=True, help="Remove selected point"):
-                clear_spatial_selection()
-                st.rerun()
-        with col_b2:
-            if st.button("🔍 Recon Scan", use_container_width=True, help="Run reconnaissance scan on selected point"):
-                pt = st.session_state.selected_points[0] if st.session_state.selected_points else None
-                recon_response = dispatch_geo_query(
-                    text_prompt=None,
-                    selected_point=pt,
-                    bounding_box=None
-                )
-                if recon_response:
-                    st.session_state.messages.append({
-                        "role": "user",
-                        "content": f"Reconnaissance requested for coordinate: {plat:.4f}°, {plng:.4f}°"
-                    })
-                    st.session_state.messages.append(_build_assistant_message(recon_response))
-                    st.session_state.map_layers.extend(recon_response.layers)
-                    if getattr(recon_response, "map_bbox", None):
-                        st.session_state.last_map_bbox = recon_response.map_bbox
-                    if not st.session_state.get("keep_points", False):
-                        clear_spatial_selection()
-                    st.rerun()
-
-        st.checkbox("Keep point selected after sending prompt", key="keep_points")
-
-    # If neither is active:
-    else:
-        st.markdown(
-            "<div class='geo-status-box'>"
-            "🎯 <b>Interactive Targeting Ready:</b><br>"
-            "• <b>Click Map:</b> Selects a tactical target point.<br>"
-            "• <b>Draw Rectangle:</b> Use the map toolbar (top-left) to bound an Area of Interest."
-            "</div>",
-            unsafe_allow_html=True
-        )
-
-    st.markdown("---")
-
     # Session metrics
     st.subheader("📊 Session Telemetry")
     col_m1, col_m2 = st.columns(2)
@@ -2492,10 +2806,11 @@ with st.sidebar:
     st.metric("RAG Query Logs", len(st.session_state.get("rag_logs", [])))
 
     st.markdown("---")
+    _leg_shape = st.session_state.get("pin_shape", "Diamond")
     st.markdown("### 🧭 Layer Legend")
-    st.markdown("- 🔷 **Sky Blue Diamond (`#`)**: **Primary Place** (numbered & cited in the answer)")
-    st.markdown("- 🔴 **Signal Red Diamond (`!`)**: **Event** or Tactical Focus")
-    st.markdown("- 🟠 **Dashed Amber Diamond (`?`)**: **Uncertain Location** (inferred coordinates)")
+    st.markdown(f"- 🔷 **Sky Blue {_leg_shape} (`#`)**: **Primary Place** (numbered & cited in the answer)")
+    st.markdown(f"- 🔴 **Signal Red {_leg_shape} (`!`)**: **Event** or Tactical Focus")
+    st.markdown(f"- 🟠 **Dashed Amber {_leg_shape} (`?`)**: **Uncertain Location** (inferred coordinates)")
     st.markdown("- 🔹 **Compact Dot / Cyan Ring**: **Context Place** & Cluster Count")
     st.markdown("- 🎯 **Cyan Crosshair / Corner Brackets**: **Active Target** & Bounding Box")
 
@@ -3189,12 +3504,30 @@ with col2:
                 animation: geoai-pulse 2s ease-out infinite;
                 pointer-events: none;
             }
+            .geoai-reticle__spin {
+                display: none;
+                position: absolute;
+                inset: 2px;
+                border-radius: 50%;
+                border: 1.5px dashed var(--geoai-selection);
+                pointer-events: none;
+                animation: geoai-spin 3s linear infinite;
+            }
+            .geoai-reticle--querying .geoai-reticle__pulse {
+                animation-duration: 1s !important;
+            }
+            .geoai-reticle--querying .geoai-reticle__spin {
+                display: block;
+            }
             @keyframes geoai-pulse {
                 0% { transform: scale(0.6); opacity: 0.9; }
                 100% { transform: scale(2.3); opacity: 0; }
             }
+            @keyframes geoai-spin {
+                to { transform: rotate(360deg); }
+            }
 
-            /* Primary / Event / Uncertain Diamond Pins */
+            /* Primary / Event / Uncertain Diamond & Teardrop Pins */
             .geoai-diamond {
                 width: 20px;
                 height: 20px;
@@ -3206,7 +3539,7 @@ with col2:
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                transition: transform 0.15s ease;
+                transition: transform 0.15s ease, border-radius 0.15s ease;
                 box-shadow: 0 0 0 1px var(--geoai-halo), 0 0 10px rgba(0, 229, 255, 0.35);
             }
             .geoai-diamond > span {
@@ -3216,6 +3549,23 @@ with col2:
             }
             .geoai-pin:hover .geoai-diamond {
                 transform: rotate(45deg) scale(1.18);
+            }
+            /* Teardrop Pin Shape Variant (both initial class and 0ms container toggle) */
+            .geoai-diamond.geoai-teardrop,
+            .geoai-shape-teardrop .geoai-diamond {
+                width: 24px;
+                height: 24px;
+                margin: -1px;
+                border-radius: 50% 50% 50% 0;
+                transform: translateY(-14px) rotate(-45deg);
+            }
+            .geoai-diamond.geoai-teardrop > span,
+            .geoai-shape-teardrop .geoai-diamond > span {
+                transform: rotate(45deg);
+            }
+            .geoai-pin:hover .geoai-diamond.geoai-teardrop,
+            .geoai-shape-teardrop .geoai-pin:hover .geoai-diamond {
+                transform: translateY(-14px) rotate(-45deg) scale(1.15);
             }
             .geoai-diamond--uncertain {
                 border-style: dashed;
@@ -3233,6 +3583,12 @@ with col2:
                 text-align: center;
                 font-style: normal;
                 box-shadow: 0 0 0 1.5px var(--geoai-halo);
+                transition: top 0.15s ease, right 0.15s ease;
+            }
+            .geoai-pin--teardrop .geoai-badge-unc,
+            .geoai-shape-teardrop .geoai-badge-unc {
+                top: -20px;
+                right: -7px;
             }
 
             /* Lightweight 8px Context Dot */
@@ -3251,12 +3607,25 @@ with col2:
                 opacity: 1;
             }
 
-            /* Bounding Box L-shaped Corner Brackets */
+            /* Bounding Box L-shaped Corner Brackets (Exact Vertex Alignment) */
             .geoai-corner {
+                position: relative;
                 width: 16px;
                 height: 16px;
+                margin: 0;
+                padding: 0;
+                display: block;
+                line-height: 0;
                 color: var(--geoai-selection);
                 filter: drop-shadow(0 0 3px var(--geoai-selection));
+            }
+            .geoai-corner svg {
+                position: absolute;
+                top: 0;
+                left: 0;
+                width: 16px;
+                height: 16px;
+                display: block;
             }
             .geoai-corner--dim {
                 opacity: 0.40;
@@ -3294,15 +3663,60 @@ with col2:
                 box-shadow: 0 0 0 7px rgba(0, 229, 255, 0.18), 0 0 16px rgba(0, 229, 255, 0.40);
             }
 
-            /* Bounding Box States (Selected Marching Ants vs Answered Ultra-Transparent) */
+            /* Bounding Box States (Selected Marching Ants, Querying Pulse + Scanline, Answered Ultra-Transparent) */
             path.geoai-bbox--selected {
                 animation: geoai-ants 1s linear infinite;
+            }
+            path.geoai-bbox--querying {
+                animation: geoai-ants 0.6s linear infinite, geoai-qfill 1.6s ease-in-out infinite !important;
             }
             path.geoai-bbox--answered {
                 pointer-events: none !important;
             }
             @keyframes geoai-ants {
                 to { stroke-dashoffset: -12; }
+            }
+            @keyframes geoai-qfill {
+                0%, 100% { fill-opacity: 0.08; }
+                50% { fill-opacity: 0.20; }
+            }
+            .geoai-scan-svg {
+                pointer-events: none !important;
+                overflow: hidden;
+            }
+            .geoai-scan-line {
+                stroke: var(--geoai-selection);
+                stroke-width: 2;
+                opacity: 0.9;
+                vector-effect: non-scaling-stroke;
+                filter: drop-shadow(0 0 6px var(--geoai-selection));
+            }
+            .geoai-scan-band {
+                fill: url(#geoai-scan-grad);
+                pointer-events: none;
+            }
+
+            /* Pin Shape Segmented Control inside PinFilterControl */
+            .geoai-shape-seg {
+                display: flex;
+                gap: 4px;
+                margin-top: 2px;
+            }
+            .geoai-shape-btn {
+                flex: 1;
+                background: rgba(11, 15, 23, 0.65);
+                color: var(--geoai-selection);
+                border: 1px solid rgba(0, 229, 255, 0.28);
+                border-radius: 3px;
+                padding: 2px 6px;
+                font: 700 10px/1.3 'JetBrains Mono', 'Fira Code', monospace;
+                cursor: pointer;
+                transition: background 0.12s ease, border-color 0.12s ease;
+            }
+            .geoai-shape-btn.active {
+                background: rgba(0, 229, 255, 0.22);
+                border-color: var(--geoai-selection);
+                box-shadow: 0 0 6px rgba(0, 229, 255, 0.25);
             }
 
             /* Unified Tactical Popup Card */
@@ -3437,7 +3851,8 @@ with col2:
                     "fillColor": t_cfg["primary"],
                     "fillOpacity": 0.10,
                     "weight": 2,
-                    "dashArray": "6, 6"
+                    "dashArray": "6, 6",
+                    "className": "geoai-bbox geoai-bbox--selected"
                 }
             },
         },
@@ -3470,8 +3885,13 @@ with col2:
     ).add_to(tactical_layers_fg)
 
     # Render visually distinct marker(s) or bounding box for all currently selected points
+    is_querying = bool(st.session_state.get("pending_query"))
+    sync_bbox_state = "none"
+    sync_bbox_bounds = None
+
     if st.session_state.get("bounding_box"):
         b_ll, b_ur = st.session_state.bounding_box
+        sync_bbox_bounds = [[b_ll[0], b_ll[1]], [b_ur[0], b_ur[1]]]
         is_answered_bbox = (
             st.session_state.get("answered_bbox") == st.session_state.bounding_box
             or any(
@@ -3479,7 +3899,8 @@ with col2:
                 for l in st.session_state.get("map_layers", [])
             )
         )
-        bb_state = "answered" if is_answered_bbox else "selected"
+        bb_state = "answered" if is_answered_bbox else ("querying" if is_querying else "selected")
+        sync_bbox_state = bb_state
         bb_cfg = bbox_style(bb_state)
 
         # 1. Lower-Left (SW) Corner Bracket
@@ -3576,6 +3997,17 @@ with col2:
             popup=folium.Popup(popup_html, max_width=250, show=True),
             icon=make_pin_icon(role="target")
         ).add_to(selection_fg)
+
+    # Attach SelectionSyncHook so every feature_group_to_add update purges stale client-side
+    # preview layers (corner brackets, drawnItems, instant target markers) and syncs pin shape
+    SelectionSyncHook(
+        has_selection=bool(st.session_state.get("selected_points") or st.session_state.get("bounding_box")),
+        clear_seq=st.session_state.get("selection_clear_seq", 0),
+        bbox_state=sync_bbox_state,
+        is_querying=is_querying,
+        bbox_bounds=sync_bbox_bounds,
+        pin_shape=st.session_state.get("pin_shape", "Diamond"),
+    ).add_to(selection_fg)
 
     # Render all persistent MapLayer objects from session state
     for layer in st.session_state.map_layers:
