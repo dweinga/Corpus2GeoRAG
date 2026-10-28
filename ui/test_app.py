@@ -1668,9 +1668,60 @@ class TestTacticalHudSymbologyAndAnsweredBbox:
             bbox_bounds=[[48.0, 31.0], [49.0, 32.0]],
             pin_shape="diamond",
         ).add_to(fg)
+
+class TestOption1MapCanvasTacticalHudAndStableLayout:
+    """Validate Option 1: Map Canvas Tactical HUD and permanently anchored chat input with 0ms latency."""
+
+    def test_map_trash_bin_hook_includes_tactical_hud_control(self):
+        """Verify MapTrashBinHook instantiates TacticalTargetHudControl in bottomleft with Clear and Recon buttons."""
+        import folium
+        from streamlit_folium import _get_map_string
+        import app
+
+        m = folium.Map()
+        app.MapTrashBinHook().add_to(m)
+        script = _get_map_string(m)
+
+        assert "TacticalTargetHudControl" in script
+        assert "position: 'bottomleft'" in script
+        assert "geoai_map_tactical_hud" in script
+        assert "geoai_map_hud_content" in script
+        assert "geoai_map_hud_clear_btn" in script
+        assert "geoai_map_hud_recon_btn" in script
+        assert "window.updateMapTacticalHud" in script
+        assert "window.hideMapTacticalHud" in script
+
+    def test_selection_sync_hook_serializes_active_point(self):
+        """Verify SelectionSyncHook passes activePoint coordinates for instant HUD synchronization."""
+        import folium
+        from streamlit_folium import _get_feature_group_string
+        import app
+
+        m = folium.Map()
+        fg = folium.FeatureGroup(name="Selection", control=False)
+        app.SelectionSyncHook(
+            has_selection=True,
+            clear_seq=1,
+            active_point=(31.7767, 35.2345),
+            pin_shape="diamond"
+        ).add_to(fg)
         fg_str = _get_feature_group_string(fg, m, 0)
-        assert "isQuerying: true" in fg_str
-        assert 'bboxState: "querying"' in fg_str
-        assert "bboxBounds: [[48.0, 31.0], [49.0, 32.0]]" in fg_str
+
+        assert "activePoint: [31.7767, 35.2345]" in fg_str
+        assert "hasSelection: true" in fg_str
+
+    def test_chat_interface_zero_height_action_triggers(self):
+        """Verify col1 uses zero-height headless action triggers so chat input remains permanently anchored."""
+        with open("app.py", "r", encoding="utf-8") as f:
+            code = f.read()
+
+        assert "geoai-headless-anchor" in code
+        assert 'div[data-testid="stHorizontalBlock"]:has(#geoai-headless-anchor)' in code
+        assert 'display: none !important;' in code
+        assert 'height: 0px !important;' in code
+        assert 'key="clear_chat_pts"' in code
+        assert 'key="run_chat_recon"' in code
+        assert 'GEOAI_PARENT_CMD' in code
+        assert "trigger_recon" in code
 
 

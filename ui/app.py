@@ -560,6 +560,7 @@ class SelectionSyncHook(MacroElement):
                 bboxState: "{{ this.bbox_state }}",
                 isQuerying: {{ 'true' if this.is_querying else 'false' }},
                 bboxBounds: {{ this.bbox_bounds_js }},
+                activePoint: {{ this.active_point_js }},
                 pinShape: "{{ this.pin_shape }}"
             });
         }
@@ -573,6 +574,7 @@ class SelectionSyncHook(MacroElement):
         bbox_state: str = "selected",
         is_querying: bool = False,
         bbox_bounds: Optional[List[List[float]]] = None,
+        active_point: Optional[Tuple[float, float]] = None,
         pin_shape: str = "diamond",
     ):
         super().__init__()
@@ -581,6 +583,7 @@ class SelectionSyncHook(MacroElement):
         self.bbox_state = bbox_state
         self.is_querying = bool(is_querying)
         self.bbox_bounds_js = json.dumps(bbox_bounds) if bbox_bounds else "null"
+        self.active_point_js = json.dumps(list(active_point)) if active_point else "null"
         self.pin_shape = (pin_shape or "diamond").strip().lower()
 
 
@@ -1024,6 +1027,7 @@ class MapTrashBinHook(MacroElement):
 
                 if (!state.hasSelection) {
                     window._isClientQuerying = false;
+                    window.hideMapTacticalHud && window.hideMapTacticalHud();
                     clearPreviousSelectionInstantly();
                     if (window.__GLOBAL_DATA__) {
                         window.__GLOBAL_DATA__.lat_lng_clicked = null;
@@ -1036,13 +1040,26 @@ class MapTrashBinHook(MacroElement):
                             action: 'clear'
                         }, '*');
                     } catch(err) {}
-                } else if (state.isQuerying || (window._isClientQuerying && state.bboxState !== 'answered')) {
-                    setTimeout(function() {
-                        startQueryingAnimation(state.bboxBounds || window._lastKnownBboxBounds);
-                    }, 30);
                 } else {
-                    window._isClientQuerying = false;
-                    stopQueryingAnimation();
+                    if (typeof window.updateMapTacticalHud === 'function') {
+                        if (state.activePoint) {
+                            window.updateMapTacticalHud({ type: 'point', lat: state.activePoint[0], lng: state.activePoint[1] });
+                        } else if (state.bboxBounds) {
+                            window.updateMapTacticalHud({ type: 'bbox', sw: state.bboxBounds[0], ne: state.bboxBounds[1] });
+                        }
+                    } else if (state.activePoint) {
+                        window._lastHudInfo = { type: 'point', lat: state.activePoint[0], lng: state.activePoint[1] };
+                    } else if (state.bboxBounds) {
+                        window._lastHudInfo = { type: 'bbox', sw: state.bboxBounds[0], ne: state.bboxBounds[1] };
+                    }
+                    if (state.isQuerying || (window._isClientQuerying && state.bboxState !== 'answered')) {
+                        setTimeout(function() {
+                            startQueryingAnimation(state.bboxBounds || window._lastKnownBboxBounds);
+                        }, 30);
+                    } else {
+                        window._isClientQuerying = false;
+                        stopQueryingAnimation();
+                    }
                 }
                 setTimeout(updateTrashButtonState, 50);
             };
@@ -1089,6 +1106,12 @@ class MapTrashBinHook(MacroElement):
 
                 // Immediately purge any prior selection (from previous click or python render)
                 clearPreviousSelectionInstantly();
+
+                if (typeof window.updateMapTacticalHud === 'function') {
+                    window.updateMapTacticalHud({ type: 'point', lat: lat, lng: lng });
+                } else {
+                    window._lastHudInfo = { type: 'point', lat: lat, lng: lng };
+                }
 
                 try {
                     var starIcon = geoaiIcon({ role: 'target' });
@@ -1155,6 +1178,11 @@ class MapTrashBinHook(MacroElement):
                         }
 
                         if (!alreadyActive) {
+                            if (typeof window.updateMapTacticalHud === 'function') {
+                                window.updateMapTacticalHud({ type: 'point', lat: p_lat, lng: p_lng });
+                            } else {
+                                window._lastHudInfo = { type: 'point', lat: p_lat, lng: p_lng };
+                            }
                             try {
                                 window.parent.postMessage({
                                     type: 'GEOAI_SELECTION_EVENT',
@@ -1235,6 +1263,12 @@ class MapTrashBinHook(MacroElement):
 
                     // Immediately clear any prior selection (single point or previous box)
                     clearPreviousSelectionInstantly();
+
+                    if (typeof window.updateMapTacticalHud === 'function') {
+                        window.updateMapTacticalHud({ type: 'bbox', sw: [swLat, swLng], ne: [neLat, neLng] });
+                    } else {
+                        window._lastHudInfo = { type: 'bbox', sw: [swLat, swLng], ne: [neLat, neLng] };
+                    }
 
                     try {
                         if (rect.setBounds) {
@@ -1341,6 +1375,11 @@ class MapTrashBinHook(MacroElement):
             }
 
             function triggerRemoval() {
+                if (typeof window.hideMapTacticalHud === 'function') {
+                    window.hideMapTacticalHud();
+                } else {
+                    window._lastHudInfo = null;
+                }
                 clearPreviousSelectionInstantly();
 
                 // If user triggers trash can, also clear all feature groups on map
@@ -1618,6 +1657,104 @@ class MapTrashBinHook(MacroElement):
                 }
             });
 
+            // ------------------------------------------------------------------
+            // Bottom-Left Tactical Target HUD Control (Option 1 - 0ms Client-Side)
+            // ------------------------------------------------------------------
+            var TacticalTargetHudControl = L.Control.extend({
+                options: {
+                    position: 'bottomleft'
+                },
+                onAdd: function(map) {
+                    var container = L.DomUtil.create('div', 'leaflet-control geoai-map-hud-control');
+                    var hud = L.DomUtil.create('div', 'geoai-map-hud', container);
+                    hud.id = 'geoai_map_tactical_hud';
+
+                    var content = L.DomUtil.create('span', 'geoai-map-hud-content', hud);
+                    content.id = 'geoai_map_hud_content';
+
+                    var actions = L.DomUtil.create('span', 'geoai-map-hud-actions', hud);
+                    actions.style.display = 'inline-flex';
+                    actions.style.gap = '5px';
+                    actions.style.marginLeft = '6px';
+
+                    var clearBtn = L.DomUtil.create('button', 'geoai-map-hud-btn geoai-map-hud-clear', actions);
+                    clearBtn.type = 'button';
+                    clearBtn.id = 'geoai_map_hud_clear_btn';
+                    clearBtn.innerHTML = '✕ Clear';
+                    clearBtn.title = 'Clear active target selection';
+
+                    var reconBtn = L.DomUtil.create('button', 'geoai-map-hud-btn geoai-map-hud-recon', actions);
+                    reconBtn.type = 'button';
+                    reconBtn.id = 'geoai_map_hud_recon_btn';
+                    reconBtn.innerHTML = '🔍 Recon';
+                    reconBtn.title = 'Execute reconnaissance scan on target';
+
+                    L.DomEvent.disableClickPropagation(container);
+                    L.DomEvent.disableScrollPropagation(container);
+
+                    clearBtn.addEventListener('click', function(ev) {
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        triggerRemoval();
+                    });
+
+                    reconBtn.addEventListener('click', function(ev) {
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        startQueryingAnimation();
+                        try {
+                            window.parent.postMessage({
+                                type: 'GEOAI_PARENT_CMD',
+                                action: 'trigger_recon'
+                            }, '*');
+                        } catch(e) {}
+                    });
+
+                    if (window._lastHudInfo) {
+                        setTimeout(function() {
+                            if (typeof window.updateMapTacticalHud === 'function') {
+                                window.updateMapTacticalHud(window._lastHudInfo);
+                            }
+                        }, 10);
+                    }
+
+                    return container;
+                }
+            });
+
+            window.updateMapTacticalHud = function(info) {
+                window._lastHudInfo = info;
+                try {
+                    var hud = document.getElementById('geoai_map_tactical_hud');
+                    var content = document.getElementById('geoai_map_hud_content');
+                    if (!hud || !content || !info) return;
+
+                    if (info.type === 'point') {
+                        var plat = Number(info.lat).toFixed(4);
+                        var plng = Number(info.lng).toFixed(4);
+                        content.innerHTML = "<span class='geoai-map-hud-badge'>📍 TARGET</span> " +
+                                            "<span class='geoai-map-hud-coords'>(" + plat + "°, " + plng + "°)</span>";
+                    } else if (info.type === 'bbox') {
+                        var sw_lat = Number(info.sw[0]).toFixed(4);
+                        var sw_lng = Number(info.sw[1]).toFixed(4);
+                        var ne_lat = Number(info.ne[0]).toFixed(4);
+                        var ne_lng = Number(info.ne[1]).toFixed(4);
+                        content.innerHTML = "<span class='geoai-map-hud-badge'>📦 BBOX AOI</span> " +
+                                            "<span class='geoai-map-hud-coords'>SW: " + sw_lat + "°, " + sw_lng + "° | NE: " + ne_lat + "°, " + ne_lng + "°</span>";
+                    }
+                    hud.classList.add('visible');
+                } catch(err) {}
+            };
+
+            window.hideMapTacticalHud = function() {
+                window._lastHudInfo = null;
+                try {
+                    var hud = document.getElementById('geoai_map_tactical_hud');
+                    if (hud) hud.classList.remove('visible');
+                } catch(err) {}
+            };
+
+            map.addControl(new TacticalTargetHudControl());
             map.addControl(new PinFilterControl());
         })();
         {% endmacro %}
@@ -2576,7 +2713,26 @@ st.markdown("""
     }, true);
 
     window.addEventListener('message', function(event) {
-        if (!event.data || event.data.type !== 'GEOAI_SELECTION_EVENT') return;
+        if (!event.data) return;
+        if (event.data.type === 'GEOAI_PARENT_CMD') {
+            if (event.data.action === 'trigger_recon') {
+                var reconBtn = document.querySelector('button[key="run_chat_recon"]') || Array.from(document.querySelectorAll('button')).find(function(b) {
+                    return (b.textContent || '').indexOf('Recon') !== -1;
+                });
+                if (reconBtn) {
+                    reconBtn.click();
+                }
+            } else if (event.data.action === 'trigger_clear') {
+                var clearBtn = document.querySelector('button[key="clear_chat_pts"]') || Array.from(document.querySelectorAll('button')).find(function(b) {
+                    return (b.textContent || '').indexOf('Clear') !== -1;
+                });
+                if (clearBtn) {
+                    clearBtn.click();
+                }
+            }
+            return;
+        }
+        if (event.data.type !== 'GEOAI_SELECTION_EVENT') return;
         var data = event.data;
         var slot = document.getElementById('geoai-instant-pill-slot');
         if (!slot) return;
@@ -3727,6 +3883,101 @@ with col2:
                 font-size: 11px;
                 opacity: 0.85;
             }
+
+            /* Tactical Map HUD Control (Option 1) */
+            .geoai-map-hud-control {
+                margin-bottom: 24px !important;
+                margin-left: 12px !important;
+                pointer-events: auto !important;
+                z-index: 1000 !important;
+            }
+            .geoai-map-hud {
+                display: none;
+                align-items: center;
+                gap: 8px;
+                background: rgba(14, 22, 32, 0.92);
+                backdrop-filter: blur(8px);
+                border: 1px solid rgba(0, 229, 255, 0.45);
+                border-radius: 6px;
+                padding: 6px 10px;
+                box-shadow: 0 4px 18px rgba(0, 0, 0, 0.65), 0 0 12px rgba(0, 229, 255, 0.25);
+                font-family: 'JetBrains Mono', 'Segoe UI', monospace;
+                font-size: 11px;
+                color: #e2e8f0;
+                white-space: nowrap;
+                user-select: none;
+                transition: opacity 0.2s ease, transform 0.2s ease;
+            }
+            .geoai-map-light .geoai-map-hud {
+                background: rgba(255, 255, 255, 0.94);
+                border: 1px solid rgba(15, 23, 42, 0.25);
+                box-shadow: 0 4px 14px rgba(0, 0, 0, 0.15);
+                color: #0f172a;
+            }
+            .geoai-map-hud.visible {
+                display: flex !important;
+            }
+            .geoai-map-hud-badge {
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+                font-weight: 700;
+                font-size: 10.5px;
+                color: #00e5ff;
+                letter-spacing: 0.05em;
+            }
+            .geoai-map-light .geoai-map-hud-badge {
+                color: #0284c7;
+            }
+            .geoai-map-hud-coords {
+                color: #f1f5f9;
+                font-weight: 600;
+                font-size: 11px;
+                background: rgba(0, 229, 255, 0.08);
+                border: 1px solid rgba(0, 229, 255, 0.2);
+                padding: 2px 6px;
+                border-radius: 4px;
+            }
+            .geoai-map-light .geoai-map-hud-coords {
+                color: #0f172a;
+                background: rgba(15, 23, 42, 0.05);
+                border: 1px solid rgba(15, 23, 42, 0.15);
+            }
+            .geoai-map-hud-btn {
+                border-radius: 4px;
+                padding: 3px 8px;
+                font-size: 11px;
+                font-weight: 600;
+                font-family: inherit;
+                cursor: pointer;
+                border: none;
+                outline: none;
+                display: inline-flex;
+                align-items: center;
+                gap: 3px;
+                transition: all 0.15s ease;
+            }
+            .geoai-map-hud-clear {
+                background: rgba(239, 68, 68, 0.15);
+                color: #fca5a5;
+                border: 1px solid rgba(239, 68, 68, 0.35);
+            }
+            .geoai-map-hud-clear:hover {
+                background: rgba(239, 68, 68, 0.3);
+                color: #ffffff;
+                border-color: rgba(239, 68, 68, 0.6);
+            }
+            .geoai-map-hud-recon {
+                background: rgba(0, 229, 255, 0.2);
+                color: #00e5ff;
+                border: 1px solid rgba(0, 229, 255, 0.6);
+                box-shadow: 0 0 8px rgba(0, 229, 255, 0.3);
+            }
+            .geoai-map-hud-recon:hover {
+                background: rgba(0, 229, 255, 0.35);
+                color: #ffffff;
+                box-shadow: 0 0 12px rgba(0, 229, 255, 0.5);
+            }
             </style>"""
         )
     )
@@ -3975,6 +4226,7 @@ with col2:
         bbox_state=sync_bbox_state,
         is_querying=is_querying,
         bbox_bounds=sync_bbox_bounds,
+        active_point=st.session_state.get("selected_points")[0] if st.session_state.get("selected_points") else None,
         pin_shape=st.session_state.get("pin_shape", "Diamond"),
     ).add_to(selection_fg)
 
@@ -4391,44 +4643,36 @@ with col1:
                                 })
                                 st.rerun()
 
-    # Option 3: Compact docked contextual payload pill (directly above chat input)
-    if st.session_state.get("selected_points"):
-        is_bbox = st.session_state.get("bounding_box") is not None
-        if is_bbox:
-            b_ll, b_ur = st.session_state.bounding_box
-            badge_html = (
-                f"<div class='geo-docked-pill geo-docked-pill-stacked' title='Bounding Box AOI: Lower-Left ({b_ll[0]:.4f}°, {b_ll[1]:.4f}°) | Upper-Right ({b_ur[0]:.4f}°, {b_ur[1]:.4f}°)'>"
-                f"<span class='geo-pill-icon'>📦</span>"
-                f"<div class='geo-pill-stack'>"
-                f"<div class='geo-pill-row'><span class='geo-pill-sublabel'>SW:</span><span class='geo-pill-coord'>{b_ll[0]:.4f}°, {b_ll[1]:.4f}°</span></div>"
-                f"<div class='geo-pill-row'><span class='geo-pill-sublabel'>NE:</span><span class='geo-pill-coord'>{b_ur[0]:.4f}°, {b_ur[1]:.4f}°</span></div>"
-                f"</div>"
-                f"</div>"
-            )
-            clear_btn_label = "❌ Clear"
-            recon_btn_label = "🔍 Recon"
-        else:
-            plat, plng = st.session_state.selected_points[0]
-            badge_html = (
-                f"<div class='geo-docked-pill' title='Attached Tactical Target: ({plat:.4f}°, {plng:.4f}°)'>"
-                f"<span class='geo-pill-icon'>📍</span>"
-                f"<span class='geo-pill-label'>TARGET:</span>"
-                f"<span class='geo-pill-coord'>({plat:.4f}°, {plng:.4f}°)</span>"
-                f"</div>"
-            )
-            clear_btn_label = "❌ Clear"
-            recon_btn_label = "🔍 Recon"
-
-        col_pill, col_clr, col_rec = st.columns([5.2, 2.1, 2.7])
-        with col_pill:
-            st.markdown(badge_html, unsafe_allow_html=True)
-        with col_clr:
-            if st.button(clear_btn_label, key="clear_chat_pts", use_container_width=True, help="Clear active spatial selection"):
+    # Option 1: Map Canvas Tactical HUD & Zero-Height Chat Action Triggers
+    # The active target/AOI HUD and its [✕ Clear] and [🔍 Recon] actions live on the Leaflet Map Canvas (col2).
+    # The headless action triggers below remain in the Streamlit widget tree at zero height for
+    # parent window command bridging and backwards compatibility, with zero vertical layout shift or taskbar clipping.
+    with st.container():
+        st.markdown(
+            """<style>
+            div[data-testid="stHorizontalBlock"]:has(#geoai-headless-anchor) {
+                display: none !important;
+                height: 0px !important;
+                max-height: 0px !important;
+                margin: 0px !important;
+                padding: 0px !important;
+                overflow: hidden !important;
+            }
+            </style>
+            <div id='geoai-instant-pill-slot' style='display: none;'></div>
+            """,
+            unsafe_allow_html=True
+        )
+        col_h1, col_h2 = st.columns(2)
+        with col_h1:
+            st.markdown("<div id='geoai-headless-anchor' style='display:none;'></div>", unsafe_allow_html=True)
+            if st.button("❌ Clear", key="clear_chat_pts", help="Clear active spatial selection"):
                 clear_spatial_selection()
                 st.rerun()
-        with col_rec:
-            if st.button(recon_btn_label, key="run_chat_recon", use_container_width=True, help="Run instant reconnaissance scan"):
+        with col_h2:
+            if st.button("🔍 Recon", key="run_chat_recon", help="Run instant reconnaissance scan"):
                 if not st.session_state.get("pending_query"):
+                    is_bbox = st.session_state.get("bounding_box") is not None
                     active_pt = None if is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
                     active_bbox = st.session_state.get("bounding_box") if is_bbox else None
                     st.session_state.pending_query = {
@@ -4437,9 +4681,6 @@ with col1:
                         "bounding_box": active_bbox,
                         "is_recon": True,
                     }
-    else:
-        # Instant HUD container placeholder for 0ms client-side pre-rendering
-        st.markdown("<div id='geoai-instant-pill-slot' style='display: none;'></div>", unsafe_allow_html=True)
 
     # Chat input box for user queries
     user_prompt = st.chat_input("Type a question (e.g. 'What units are stationed here?')...", key="geoai_chat_input")
