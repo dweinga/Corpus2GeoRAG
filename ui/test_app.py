@@ -1631,3 +1631,47 @@ class TestTacticalHudSymbologyAndAnsweredBbox:
         # 3. Leaflet map ResizeObserver to invalidate tile size on container resizing
         assert "map.invalidateSize()" in code
 
+    def test_active_querying_animation_and_early_query_ingestion(self):
+        """Verify active querying animation hooks and early query queueing before col2 map renders."""
+        import folium
+        from streamlit_folium import _get_feature_group_string, _get_map_string
+        import app
+
+        with open("app.py", "r", encoding="utf-8") as f:
+            code = f.read()
+
+        # 1. Section 2c Early Query Ingestion must precede with col2:
+        sec2c_pos = code.find("2c. Early Query Ingestion & Queueing")
+        col2_pos = code.find("with col2:")
+        assert sec2c_pos != -1, "Section 2c must be defined"
+        assert sec2c_pos < col2_pos, "Section 2c must precede with col2: so pending_query is queued before map renders"
+
+        # 2. Section 2c must check both chat_input and run_chat_recon
+        assert 'st.session_state.get("geoai_chat_input")' in code
+        assert 'st.session_state.get("run_chat_recon")' in code
+        assert 'key="geoai_chat_input"' in code
+
+        # 3. Leaflet hooks must track _isClientQuerying and _lastKnownBboxBounds
+        m = folium.Map()
+        app.MapTrashBinHook().add_to(m)
+        map_script = _get_map_string(m)
+        assert "_isClientQuerying" in map_script
+        assert "_lastKnownBboxBounds" in map_script
+        assert "startQueryingAnimation(state.bboxBounds || window._lastKnownBboxBounds)" in map_script
+
+        # 4. SelectionSyncHook must emit isQuerying: true and bboxState: "querying"
+        fg = folium.FeatureGroup(name="Active Selection", control=False)
+        app.SelectionSyncHook(
+            has_selection=True,
+            clear_seq=0,
+            bbox_state="querying",
+            is_querying=True,
+            bbox_bounds=[[48.0, 31.0], [49.0, 32.0]],
+            pin_shape="diamond",
+        ).add_to(fg)
+        fg_str = _get_feature_group_string(fg, m, 0)
+        assert "isQuerying: true" in fg_str
+        assert 'bboxState: "querying"' in fg_str
+        assert "bboxBounds: [[48.0, 31.0], [49.0, 32.0]]" in fg_str
+
+

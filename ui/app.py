@@ -703,8 +703,9 @@ class MapTrashBinHook(MacroElement):
                         }
                     }
                     var targetBounds = boundsOverride || null;
-                    map.eachLayer(function(l) {
-                        if (l && l.getBounds && l._path) {
+                    function checkLayer(l) {
+                        if (!l) return;
+                        if (l.getBounds && l._path) {
                             var cls = ((l.options && l.options.className) || '') + ' ' + (l._path.getAttribute('class') || '');
                             if (cls.indexOf('geoai-bbox--selected') !== -1 || cls.indexOf('geoai-bbox--querying') !== -1) {
                                 l._path.classList.add('geoai-bbox--querying');
@@ -713,7 +714,22 @@ class MapTrashBinHook(MacroElement):
                                 }
                             }
                         }
-                    });
+                        if (l.eachLayer && typeof l.eachLayer === 'function') {
+                            try { l.eachLayer(checkLayer); } catch(err2) {}
+                        }
+                    }
+                    map.eachLayer(checkLayer);
+
+                    if (!targetBounds && window._instantBboxLayers && window._instantBboxLayers[0] && typeof window._instantBboxLayers[0].getBounds === 'function') {
+                        targetBounds = window._instantBboxLayers[0].getBounds();
+                    }
+                    if (!targetBounds && window._lastKnownBboxBounds) {
+                        targetBounds = window._lastKnownBboxBounds;
+                    }
+                    if (targetBounds) {
+                        window._lastKnownBboxBounds = targetBounds;
+                    }
+
                     if (targetBounds && typeof L.svgOverlay === 'function') {
                         var svgEl = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
                         svgEl.setAttribute('viewBox', '0 0 100 100');
@@ -1000,10 +1016,14 @@ class MapTrashBinHook(MacroElement):
                 if (state.pinShape) {
                     setMapPinShape(state.pinShape);
                 }
+                if (state.bboxBounds) {
+                    window._lastKnownBboxBounds = state.bboxBounds;
+                }
                 // Always clear temporary client-side preview layers once selection_fg has mounted from Python
                 clearInstantPreviewOnly();
 
                 if (!state.hasSelection) {
+                    window._isClientQuerying = false;
                     clearPreviousSelectionInstantly();
                     if (window.__GLOBAL_DATA__) {
                         window.__GLOBAL_DATA__.lat_lng_clicked = null;
@@ -1016,11 +1036,12 @@ class MapTrashBinHook(MacroElement):
                             action: 'clear'
                         }, '*');
                     } catch(err) {}
-                } else if (state.isQuerying) {
+                } else if (state.isQuerying || (window._isClientQuerying && state.bboxState !== 'answered')) {
                     setTimeout(function() {
-                        startQueryingAnimation(state.bboxBounds);
+                        startQueryingAnimation(state.bboxBounds || window._lastKnownBboxBounds);
                     }, 30);
                 } else {
+                    window._isClientQuerying = false;
                     stopQueryingAnimation();
                 }
                 setTimeout(updateTrashButtonState, 50);
@@ -1031,8 +1052,10 @@ class MapTrashBinHook(MacroElement):
                 if (!ev || !ev.data) return;
                 if (ev.data.type === 'GEOAI_QUERY_STATE') {
                     if (ev.data.state === 'querying') {
+                        window._isClientQuerying = true;
                         startQueryingAnimation();
                     } else {
+                        window._isClientQuerying = false;
                         stopQueryingAnimation();
                     }
                 } else if (ev.data.type === 'GEOAI_PARENT_CMD' && ev.data.action === 'clear') {
@@ -1198,6 +1221,7 @@ class MapTrashBinHook(MacroElement):
                     var swLng = Math.round(Math.min(rawSW.lng, rawNE.lng) * 100000) / 100000;
                     var neLat = Math.round(Math.max(rawSW.lat, rawNE.lat) * 100000) / 100000;
                     var neLng = Math.round(Math.max(rawSW.lng, rawNE.lng) * 100000) / 100000;
+                    window._lastKnownBboxBounds = [[swLat, swLng], [neLat, neLng]];
 
                     // Send 0ms instant selection event to parent window HUD
                     try {
@@ -2570,6 +2594,19 @@ st.markdown("""
             return;
         }
 
+        // 1b. Instant preview pill Recon button
+        var instRec = target.closest('[data-geoai-action="recon"]');
+        if (instRec) {
+            postToMapIframes({ type: 'GEOAI_QUERY_STATE', state: 'querying' });
+            var realBtn = document.querySelector('button[key="run_chat_recon"]') || Array.from(document.querySelectorAll('button')).find(function(b) {
+                return (b.textContent || '').indexOf('Recon') !== -1;
+            });
+            if (realBtn) {
+                realBtn.click();
+            }
+            return;
+        }
+
         // 2. Streamlit Clear / Reset buttons -> 0ms visual cleanup in map iframe
         var btn = target.closest('button');
         if (btn) {
@@ -2589,9 +2626,11 @@ st.markdown("""
                 return;
             }
             // 3. Recon Scan or Chat Submit button -> 0ms querying scanline + pulse
+            var inChatInput = Boolean(btn.closest('div[data-testid="stChatInput"]'));
             if (
                 txt.indexOf('Recon') !== -1 ||
-                btn.getAttribute('data-testid') === 'stChatInputSubmitButton'
+                btn.getAttribute('data-testid') === 'stChatInputSubmitButton' ||
+                inChatInput
             ) {
                 postToMapIframes({ type: 'GEOAI_QUERY_STATE', state: 'querying' });
             }
@@ -2645,7 +2684,7 @@ st.markdown("""
             slot.innerHTML = "<div class='geoai-instant-pill-row'>" +
                              "<div class='geoai-instant-pill-col-left'>" + pillHtml + "</div>" +
                              "<div class='geoai-instant-pill-col-mid'><div class='geoai-instant-btn' data-geoai-action='clear' style='cursor:pointer;'>❌ Clear</div></div>" +
-                             "<div class='geoai-instant-pill-col-right'><div class='geoai-instant-btn'>🔍 Recon</div></div>" +
+                             "<div class='geoai-instant-pill-col-right'><div class='geoai-instant-btn' data-geoai-action='recon' style='cursor:pointer;'>🔍 Recon</div></div>" +
                              "</div>";
             slot.style.display = 'block';
         }
@@ -2917,6 +2956,42 @@ if _early_map_state and isinstance(_early_map_state, dict):
                 st.session_state.bounding_box = None
                 st.session_state.answered_bbox = None
                 st.session_state.active_point = _c_pt
+
+# ------------------------------------------------------------------------------
+# 2c. Early Query Ingestion & Queueing
+# ------------------------------------------------------------------------------
+# Checks if a chat query or recon scan was submitted on this turn.
+# Queuing pending_query BEFORE Section 4 (col2 map) renders ensures that
+# SelectionSyncHook and the bounding box feature group render with is_querying=True,
+# keeping the pulsing fill & sweeping scan line animation actively visible during
+# backend RAG dispatch without requiring redundant reruns or incurring latency.
+_incoming_chat = st.session_state.get("geoai_chat_input")
+_incoming_recon = bool(st.session_state.get("run_chat_recon"))
+
+if not st.session_state.get("pending_query"):
+    _is_bbox = st.session_state.get("bounding_box") is not None
+    _active_pt = None if _is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
+    _active_bbox = st.session_state.get("bounding_box") if _is_bbox else None
+
+    if (
+        _incoming_chat
+        and isinstance(_incoming_chat, str)
+        and _incoming_chat.strip()
+        and _incoming_chat != st.session_state.get("last_processed_chat_input")
+    ):
+        st.session_state.last_processed_chat_input = _incoming_chat
+        st.session_state.pending_query = {
+            "text_prompt": _incoming_chat.strip(),
+            "selected_point": _active_pt,
+            "bounding_box": _active_bbox,
+        }
+    elif _incoming_recon:
+        st.session_state.pending_query = {
+            "text_prompt": None,
+            "selected_point": _active_pt,
+            "bounding_box": _active_bbox,
+            "is_recon": True,
+        }
 
 # ==============================================================================
 # 3. Sidebar Utility Controls & Intelligence Dashboard
@@ -4468,42 +4543,26 @@ with col1:
                 st.rerun()
         with col_rec:
             if st.button(recon_btn_label, key="run_chat_recon", use_container_width=True, help="Run instant reconnaissance scan"):
-                active_pt = None if is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
-                active_bbox = st.session_state.get("bounding_box") if is_bbox else None
-
-                recon_resp = dispatch_geo_query(
-                    text_prompt=None,
-                    selected_point=active_pt,
-                    bounding_box=active_bbox
-                )
-                if recon_resp:
-                    if is_bbox and st.session_state.get("bounding_box"):
-                        b_ll, b_ur = st.session_state.bounding_box
-                        user_msg = f"Reconnaissance requested for bounding box: Lower-Left ({b_ll[0]:.4f}°, {b_ll[1]:.4f}°), Upper-Right ({b_ur[0]:.4f}°, {b_ur[1]:.4f}°)"
-                    else:
-                        plat, plng = st.session_state.selected_points[0]
-                        user_msg = f"Reconnaissance requested for coordinate: ({plat:.4f}°, {plng:.4f}°)"
-
-                    st.session_state.messages.append({"role": "user", "content": user_msg})
-                    st.session_state.messages.append(_build_assistant_message(recon_resp))
-                    st.session_state.map_layers.extend(recon_resp.layers)
-                    if is_bbox and st.session_state.get("bounding_box"):
-                        st.session_state.answered_bbox = st.session_state.bounding_box
-                    if getattr(recon_resp, "map_bbox", None):
-                        st.session_state.last_map_bbox = recon_resp.map_bbox
-                    if not st.session_state.get("keep_points", False):
-                        clear_spatial_selection()
-                    st.rerun()
+                if not st.session_state.get("pending_query"):
+                    active_pt = None if is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
+                    active_bbox = st.session_state.get("bounding_box") if is_bbox else None
+                    st.session_state.pending_query = {
+                        "text_prompt": None,
+                        "selected_point": active_pt,
+                        "bounding_box": active_bbox,
+                        "is_recon": True,
+                    }
     else:
         # Instant HUD container placeholder for 0ms client-side pre-rendering
         st.markdown("<div id='geoai-instant-pill-slot' style='display: none;'></div>", unsafe_allow_html=True)
 
     # Chat input box for user queries
-    user_prompt = st.chat_input("Type a question (e.g. 'What units are stationed here?')...")
+    user_prompt = st.chat_input("Type a question (e.g. 'What units are stationed here?')...", key="geoai_chat_input")
 
     if user_prompt:
         # 1. Append user's message to chat history
-        st.session_state.messages.append({"role": "user", "content": user_prompt})
+        if not st.session_state.messages or st.session_state.messages[-1].get("content") != user_prompt:
+            st.session_state.messages.append({"role": "user", "content": user_prompt})
 
         # 2. Immediately render user's question into chat_container so user sees it right away
         with chat_container:
@@ -4512,14 +4571,15 @@ with col1:
                 st.markdown(user_prompt)
 
         # 3. Queue pending query in session state so component mount/sync reruns never drop it
-        is_bbox = st.session_state.get("bounding_box") is not None
-        active_pt = None if is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
-        active_bbox = st.session_state.get("bounding_box") if is_bbox else None
-        st.session_state.pending_query = {
-            "text_prompt": user_prompt,
-            "selected_point": active_pt,
-            "bounding_box": active_bbox,
-        }
+        if not st.session_state.get("pending_query"):
+            is_bbox = st.session_state.get("bounding_box") is not None
+            active_pt = None if is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
+            active_bbox = st.session_state.get("bounding_box") if is_bbox else None
+            st.session_state.pending_query = {
+                "text_prompt": user_prompt,
+                "selected_point": active_pt,
+                "bounding_box": active_bbox,
+            }
 
 
 # ------------------------------------------------------------------------------
@@ -4527,6 +4587,27 @@ with col1:
 # ------------------------------------------------------------------------------
 if st.session_state.get("pending_query"):
     pq = st.session_state.pending_query
+
+    # If this was triggered via Recon scan, render user recon intent in chat
+    if pq.get("is_recon"):
+        is_bbox_pq = pq.get("bounding_box") is not None
+        if is_bbox_pq:
+            b_ll, b_ur = pq["bounding_box"]
+            recon_user_msg = f"Reconnaissance requested for bounding box: Lower-Left ({b_ll[0]:.4f}°, {b_ll[1]:.4f}°), Upper-Right ({b_ur[0]:.4f}°, {b_ur[1]:.4f}°)"
+        elif pq.get("selected_point"):
+            plat, plng = pq["selected_point"]
+            recon_user_msg = f"Reconnaissance requested for coordinate: ({plat:.4f}°, {plng:.4f}°)"
+        else:
+            recon_user_msg = "Reconnaissance requested"
+
+        if not st.session_state.messages or st.session_state.messages[-1].get("content") != recon_user_msg:
+            st.session_state.messages.append({"role": "user", "content": recon_user_msg})
+
+        with chat_container:
+            with st.chat_message("user", avatar=t_cfg["user_avatar"]):
+                st.markdown(f"<div class='chat-role-tag chat-role-operator'><span class='bubble-marker-operator'></span>{t_cfg['operator_tag']}</div>", unsafe_allow_html=True)
+                st.markdown(recon_user_msg)
+
     with chat_container:
         agent_resp = dispatch_geo_query(
             text_prompt=pq.get("text_prompt"),
