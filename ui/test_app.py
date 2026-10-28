@@ -1724,4 +1724,32 @@ class TestOption1MapCanvasTacticalHudAndStableLayout:
         assert 'GEOAI_PARENT_CMD' in code
         assert "trigger_recon" in code
 
+    def test_tactical_hud_recon_dispatch_and_no_col1_leak(self):
+        """Verify TacticalTargetHudControl dispatches recon via Folium bridge, Section 2b handles it, and col1 has no leaked div."""
+        import folium
+        from streamlit_folium import _get_map_string
+
+        m = folium.Map()
+        import app
+        app.MapTrashBinHook().add_to(m)
+        script = _get_map_string(m)
+
+        # Tactical HUD recon button must prepare and dispatch recon payload
+        assert 'properties: {\n                                action: "recon"' in script or 'action: "recon"' in script
+        assert "geoaiImmediateDispatch(map)" in script
+
+        with open("app.py", "r", encoding="utf-8") as f:
+            code = f.read()
+
+        # Section 2b and Section 5 handle action == "recon"
+        assert '_props.get("action") == "recon"' in code
+        assert 'props.get("action") == "recon"' in code
+        assert '"is_recon": True' in code
+
+        # Ensure col1 does NOT contain the leaked geoai-instant-pill-slot div inside col1
+        # It must only appear once in the global script block unindented
+        assert code.count('<div id="geoai-instant-pill-slot"') == 1
+        assert "<div id='geoai-instant-pill-slot'" not in code
+
+
 

@@ -1702,6 +1702,28 @@ class MapTrashBinHook(MacroElement):
                         ev.preventDefault();
                         ev.stopPropagation();
                         startQueryingAnimation();
+
+                        var reconPayload = {
+                            type: "Feature",
+                            geometry: null,
+                            properties: {
+                                action: "recon",
+                                timestamp: Date.now()
+                            }
+                        };
+                        if (window.__GLOBAL_DATA__) {
+                            window.__GLOBAL_DATA__.last_active_drawing = reconPayload;
+                        }
+                        try {
+                            if (typeof window.geoaiImmediateDispatch === "function") {
+                                window.geoaiImmediateDispatch(map);
+                            } else if (typeof updateComponentValue === "function") {
+                                updateComponentValue(map);
+                            } else if (typeof debouncedUpdateComponentValue === "function") {
+                                debouncedUpdateComponentValue(map);
+                            }
+                        } catch(e) {}
+
                         try {
                             window.parent.postMessage({
                                 type: 'GEOAI_PARENT_CMD',
@@ -2628,7 +2650,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # 0ms Instant Target HUD Bridge: listens to Leaflet map clicks/drawings in the iframe
-st.markdown("""
+st.markdown("""<div id="geoai-instant-pill-slot" style="display: none;"></div>
 <script>
 (function() {
     if (window._geoaiSelectionBridgeInstalled) return;
@@ -2718,18 +2740,22 @@ st.markdown("""
         if (!event.data) return;
         if (event.data.type === 'GEOAI_PARENT_CMD') {
             if (event.data.action === 'trigger_recon') {
-                var reconBtn = document.querySelector('button[key="run_chat_recon"]') || Array.from(document.querySelectorAll('button')).find(function(b) {
-                    return (b.textContent || '').indexOf('Recon') !== -1;
-                });
+                var reconBtn = document.querySelector('.st-key-run_chat_recon button') ||
+                    document.querySelector('button[key="run_chat_recon"]') ||
+                    Array.from(document.querySelectorAll('button')).find(function(b) {
+                        return (b.textContent || '').indexOf('Recon') !== -1;
+                    });
                 if (reconBtn) {
-                    reconBtn.click();
+                    try { reconBtn.click(); } catch(e) {}
                 }
             } else if (event.data.action === 'trigger_clear') {
-                var clearBtn = document.querySelector('button[key="clear_chat_pts"]') || Array.from(document.querySelectorAll('button')).find(function(b) {
-                    return (b.textContent || '').indexOf('Clear') !== -1;
-                });
+                var clearBtn = document.querySelector('.st-key-clear_chat_pts button') ||
+                    document.querySelector('button[key="clear_chat_pts"]') ||
+                    Array.from(document.querySelectorAll('button')).find(function(b) {
+                        return (b.textContent || '').indexOf('Clear') !== -1;
+                    });
                 if (clearBtn) {
-                    clearBtn.click();
+                    try { clearBtn.click(); } catch(e) {}
                 }
             }
             return;
@@ -2927,11 +2953,22 @@ if _early_map_state and isinstance(_early_map_state, dict):
     _early_all_drawings = _early_map_state.get("all_drawings")
     _early_clicked = _early_map_state.get("last_clicked")
 
-    # 1. Handle deletion / trash bin
+    # 1. Handle recon scan action or deletion / trash bin
     if _early_drawing:
         _props = _early_drawing.get("properties") or {}
         _geom = _early_drawing.get("geometry")
-        if (_props.get("action") == "delete" or not _geom) and _early_drawing != st.session_state.get("ignored_drawing"):
+        if _props.get("action") == "recon" and _early_drawing != st.session_state.get("ignored_drawing"):
+            st.session_state.ignored_drawing = _early_drawing
+            _is_bbox = st.session_state.get("bounding_box") is not None
+            _active_pt = None if _is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
+            _active_bbox = st.session_state.get("bounding_box") if _is_bbox else None
+            st.session_state.pending_query = {
+                "text_prompt": None,
+                "selected_point": _active_pt,
+                "bounding_box": _active_bbox,
+                "is_recon": True,
+            }
+        elif (_props.get("action") == "delete" or (not _geom and _props.get("action") != "recon")) and _early_drawing != st.session_state.get("ignored_drawing"):
             st.session_state.ignored_drawing = _early_drawing
             _has_sel = bool(st.session_state.get("selected_points") or st.session_state.get("bounding_box"))
             clear_spatial_selection()
@@ -4397,12 +4434,23 @@ with col2:
     active_drawing = map_data.get("last_active_drawing") if map_data else None
     all_drawings = map_data.get("all_drawings") if map_data else None
 
-    # Handle deletion events (trash bin icon clicked on map tools or shape deleted)
+    # Handle recon scan action or deletion events (trash bin icon clicked on map tools or shape deleted)
     if not st.session_state.get("pending_query") and active_drawing:
         props = active_drawing.get("properties") or {}
         geom = active_drawing.get("geometry")
-        if (
-            (props.get("action") == "delete" or not geom)
+        if props.get("action") == "recon" and active_drawing != st.session_state.get("ignored_drawing"):
+            st.session_state.ignored_drawing = active_drawing
+            is_bbox = st.session_state.get("bounding_box") is not None
+            active_pt = None if is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
+            active_bbox = st.session_state.get("bounding_box") if is_bbox else None
+            st.session_state.pending_query = {
+                "text_prompt": None,
+                "selected_point": active_pt,
+                "bounding_box": active_bbox,
+                "is_recon": True,
+            }
+        elif (
+            (props.get("action") == "delete" or (not geom and props.get("action") != "recon"))
             and active_drawing != st.session_state.get("ignored_drawing")
         ):
             st.session_state.ignored_drawing = active_drawing
@@ -4664,9 +4712,7 @@ with col1:
             padding: 0px !important;
             overflow: hidden !important;
         }
-        </style>
-        <div id='geoai-instant-pill-slot' style='display: none;'></div>
-        """,
+        </style>""",
         unsafe_allow_html=True
     )
     if st.button("❌ Clear", key="clear_chat_pts", help="Clear active spatial selection"):
@@ -4683,6 +4729,7 @@ with col1:
                 "bounding_box": active_bbox,
                 "is_recon": True,
             }
+            st.rerun()
 
     # Chat input box for user queries
     user_prompt = st.chat_input("Type a question (e.g. 'What units are stationed here?')...", key="geoai_chat_input")
