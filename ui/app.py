@@ -786,6 +786,38 @@ class MapTrashBinHook(MacroElement):
                 map.getContainer().classList.add('geoai-map-dark');
             }
 
+            // Instant 0ms Component Value Dispatch to bypass streamlit-folium's 250ms artificial debounce
+            window.geoaiImmediateDispatch = function(mapInstance) {
+                try {
+                    if (!window.__GLOBAL_DATA__ || !window.Streamlit || typeof window.Streamlit.setComponentValue !== 'function') return;
+                    var g = window.__GLOBAL_DATA__;
+                    var c = {
+                        last_clicked: g.lat_lng_clicked,
+                        last_active_drawing: g.last_active_drawing,
+                        all_drawings: g.all_drawings
+                    };
+                    var u = {};
+                    if (g.returned_objects && Array.isArray(g.returned_objects)) {
+                        g.returned_objects.forEach(function(k) {
+                            if (c.hasOwnProperty(k)) u[k] = c[k];
+                        });
+                    } else {
+                        u = c;
+                    }
+                    if (JSON.stringify(g.previous_data) !== JSON.stringify(u)) {
+                        g.previous_data = u;
+                        window.Streamlit.setComponentValue(u);
+                    }
+                } catch(err) {
+                    console.warn("[GeoAI] Immediate dispatch error:", err);
+                }
+            };
+            try {
+                if (typeof debouncedUpdateComponentValue === 'function') {
+                    debouncedUpdateComponentValue = window.geoaiImmediateDispatch;
+                }
+            } catch(e) {}
+
             window._mapInitializing = true;
             setTimeout(function() { window._mapInitializing = false; }, 400);
 
@@ -1055,7 +1087,9 @@ class MapTrashBinHook(MacroElement):
                     window.__GLOBAL_DATA__.lat_lng_clicked = e.latlng;
                 }
                 try {
-                    if (typeof updateComponentValue === "function") {
+                    if (typeof window.geoaiImmediateDispatch === "function") {
+                        window.geoaiImmediateDispatch(map);
+                    } else if (typeof updateComponentValue === "function") {
                         updateComponentValue(map);
                     }
                 } catch(err) {}
@@ -1101,7 +1135,9 @@ class MapTrashBinHook(MacroElement):
                                 window.__GLOBAL_DATA__.last_active_drawing = source.toGeoJSON();
                             }
                             try {
-                                if (typeof updateComponentValue === 'function') {
+                                if (typeof window.geoaiImmediateDispatch === 'function') {
+                                    window.geoaiImmediateDispatch(map);
+                                } else if (typeof updateComponentValue === 'function') {
                                     updateComponentValue(map);
                                 }
                             } catch(err) {}
@@ -1133,9 +1169,9 @@ class MapTrashBinHook(MacroElement):
                             }
                         });
                     } catch(err) {} finally {
-                        setTimeout(function() { window._reopeningPopup = false; }, 200);
+                        setTimeout(function() { window._reopeningPopup = false; }, 100);
                     }
-                }, 120);
+                }, 25);
             }
 
             // 2. Instant client-side feedback when an AOI Rectangle is drawn
@@ -1218,8 +1254,16 @@ class MapTrashBinHook(MacroElement):
                     if (btn) {
                         btn.classList.remove("leaflet-disabled");
                     }
+                    if (window.__GLOBAL_DATA__) {
+                        window.__GLOBAL_DATA__.last_active_drawing = rect.toGeoJSON();
+                        if (window.drawnItems && typeof window.drawnItems.toGeoJSON === 'function') {
+                            window.__GLOBAL_DATA__.all_drawings = window.drawnItems.toGeoJSON().features;
+                        }
+                    }
                     try {
-                        if (typeof updateComponentValue === "function") {
+                        if (typeof window.geoaiImmediateDispatch === "function") {
+                            window.geoaiImmediateDispatch(map);
+                        } else if (typeof updateComponentValue === "function") {
                             updateComponentValue(map);
                         }
                     } catch(err) {}
@@ -1300,7 +1344,9 @@ class MapTrashBinHook(MacroElement):
                 } catch(err) {}
 
                 try {
-                    if (typeof updateComponentValue === "function") {
+                    if (typeof window.geoaiImmediateDispatch === "function") {
+                        window.geoaiImmediateDispatch(map);
+                    } else if (typeof updateComponentValue === "function") {
                         updateComponentValue(map);
                     } else if (typeof debouncedUpdateComponentValue === "function") {
                         debouncedUpdateComponentValue(map);
@@ -2605,7 +2651,18 @@ if "selection_clear_seq" not in st.session_state:
 # Ingests map clicks, drawings, and deletions before the sidebar and chat mount,
 # ensuring all UI panels reflect the newest spatial selection on the initial rerun
 # without requiring a second st.rerun() cascade.
-_early_map_state = st.session_state.get("geoai_tactical_map")
+def _peek_incoming_map_state() -> Optional[Dict[str, Any]]:
+    s = st.session_state.get("geoai_tactical_map")
+    if isinstance(s, dict) and ("last_clicked" in s or "last_active_drawing" in s or "all_drawings" in s):
+        return s
+    for k in list(st.session_state.keys()):
+        if isinstance(k, str) and len(k) == 64:
+            v = st.session_state.get(k)
+            if isinstance(v, dict) and ("last_clicked" in v or "last_active_drawing" in v or "all_drawings" in v):
+                return v
+    return None
+
+_early_map_state = _peek_incoming_map_state()
 if _early_map_state and isinstance(_early_map_state, dict):
     _early_drawing = _early_map_state.get("last_active_drawing")
     _early_all_drawings = _early_map_state.get("all_drawings")
@@ -2828,234 +2885,9 @@ col1, col2 = adjustable_columns([1, 1.5], labels=col_labels, key="main_workspace
 
 
 # ------------------------------------------------------------------------------
-# 5. Left Column: Chat Interface & Query Processing
-# ------------------------------------------------------------------------------
-with col1:
-    # Render conversational message history inside a dedicated scroll container with its own scrollbar
-    # Stable container height prevents chat scroll area and input box from bouncing (AGENTS.md Rule 3.1)
-    chat_container_height = 465
-    chat_container = st.container(height=chat_container_height)
-    with chat_container:
-        for m_idx, msg in enumerate(st.session_state.messages):
-            role = msg["role"]
-            is_user = (role == "user")
-            avatar = t_cfg["user_avatar"] if is_user else t_cfg["ai_avatar"]
-            role_tag = t_cfg["operator_tag"] if is_user else t_cfg["ai_tag"]
-            if role == "assistant" and msg.get("is_live"):
-                role_tag += " • [LIVE RAG]"
-                if msg.get("grounded") is False:
-                    role_tag += " • [LLM ONLY]"
-
-            role_class = "chat-role-operator" if is_user else "chat-role-geoai"
-            marker_class = "bubble-marker-operator" if is_user else "bubble-marker-geoai"
-
-            with st.chat_message(role, avatar=avatar):
-                st.markdown(f"<div class='chat-role-tag {role_class}'><span class='{marker_class}'></span>{role_tag}</div>", unsafe_allow_html=True)
-                if role == "assistant" and not st.session_state.get("show_citations", True):
-                    st.markdown(msg.get("content_plain") or msg["content"])
-                else:
-                    st.markdown(msg["content"])
-
-                # Source Evidence Inspection Drawer
-                msg_sources = msg.get("sources", [])
-                msg_citations = {
-                    c.get("pointer"): c
-                    for c in msg.get("citations", [])
-                    if isinstance(c, dict) and c.get("pointer")
-                }
-                if msg_sources:
-                    with st.expander(f"📑 Verified Sources ({len(msg_sources)})", expanded=False):
-                        source_items_html = []
-                        for s_idx, src_doc in enumerate(msg_sources):
-                            cit_meta = msg_citations.get(src_doc, {})
-                            cit_id = cit_meta.get("id")
-                            cit_article = cit_meta.get("article")
-                            cit_section = cit_meta.get("section")
-                            cached_meta = st.session_state.get(f"src_meta_{m_idx}_{s_idx}", {})
-                            disp_article = _clean_doc_title(cit_article or cached_meta.get("document"))
-                            disp_section = _clean_doc_title(cit_section or cached_meta.get("section"))
-
-                            # Resolve document title and text from local graph if available
-                            passage = cached_meta or get_source_text(src_doc)
-                            if passage and isinstance(passage, dict):
-                                st.session_state[f"src_meta_{m_idx}_{s_idx}"] = passage
-                                if not disp_article:
-                                    disp_article = _clean_doc_title(passage.get("document"))
-                                if not disp_section:
-                                    disp_section = _clean_doc_title(passage.get("section"))
-                            else:
-                                st.session_state[f"src_meta_{m_idx}_{s_idx}"] = {"document": "", "section": ""}
-
-                            if cit_id and disp_article:
-                                title_str = f"[{cit_id}] {disp_article}"
-                            elif disp_article and disp_article != src_doc:
-                                title_str = disp_article
-                            else:
-                                title_str = f"Source Document #{s_idx + 1}"
-
-                            sec_str = f" — <i>{disp_section}</i>" if disp_section else ""
-
-                            if passage and passage.get("text"):
-                                doc_name = _clean_doc_title(passage.get("document") or cit_article or f"Document #{s_idx + 1}")
-                                sec_name = _clean_doc_title(passage.get("section") or cit_section)
-                                para_num = passage.get("paragraph_index")
-                                header_parts = [f"<b>{doc_name}</b>"]
-                                if sec_name:
-                                    header_parts.append(f"Section: <i>{sec_name}</i>")
-                                if para_num is not None:
-                                    header_parts.append(f"Paragraph #{para_num + 1}")
-                                header_str = " | ".join(header_parts)
-                                raw_text = passage["text"]
-                                spans = cit_meta.get("text_spans") or cit_meta.get("char_offsets") or passage.get("text_spans") or []
-                                highlighted_text = _highlight_text_spans(raw_text, spans)
-                                body_html = (
-                                    f"<div style='background: rgba(14, 22, 32, 0.7); border-left: 3px solid #00e5ff; padding: 10px 14px; border-radius: 4px; font-size: 0.9em; margin-top: 8px; margin-bottom: 4px; line-height: 1.5;'>"
-                                    f"<div style='font-weight: 600; margin-bottom: 6px; color: #38bdf8;'>{header_str}</div>"
-                                    f"<div style='color: #cbd5e1;'>{highlighted_text}</div>"
-                                    f"</div>"
-                                )
-                            else:
-                                body_html = (
-                                    f"<div style='background: rgba(14, 22, 32, 0.7); border-left: 3px solid #64748b; padding: 10px 14px; border-radius: 4px; font-size: 0.88em; margin-top: 8px; margin-bottom: 4px; color: #94a3b8;'>"
-                                    f"<div style='font-weight: 600; margin-bottom: 4px; color: #cbd5e1;'>Notice</div>"
-                                    f"<div>(No inline corpus text available for this reference)</div>"
-                                    f"</div>"
-                                )
-
-                            source_items_html.append(
-                                f"<details class='geoai-source-detail'>"
-                                f"<summary class='geoai-source-summary'>"
-                                f"<span class='geoai-source-title'>📄 <b>{title_str}</b>{sec_str}</span>"
-                                f"<span class='geoai-source-badge'>Inspect ▾</span>"
-                                f"</summary>"
-                                f"{body_html}"
-                                f"</details>"
-                            )
-
-                        st.markdown("".join(source_items_html), unsafe_allow_html=True)
-
-                # Upgrade 5: Regional Distribution Breakdown
-                msg_regions = msg.get("regions", {})
-                if role == "assistant" and msg_regions and isinstance(msg_regions, dict):
-                    with st.expander(f"🌍 Regional Distribution ({len(msg_regions)} regions)", expanded=False):
-                        for reg_name, count in sorted(msg_regions.items(), key=lambda x: str(x[0])):
-                            st.markdown(f"- **{reg_name}**: `{count}` places/events")
-
-                # Upgrade 4: Follow-up Suggestions & Did-You-Mean
-                if role == "assistant" and msg.get("did_you_mean"):
-                    st.info(f"💡 *Did you mean:* **{msg['did_you_mean']}**?")
-
-                msg_follow_ups = msg.get("follow_ups", [])
-                if role == "assistant" and msg_follow_ups and m_idx == len(st.session_state.messages) - 1:
-                    st.markdown("<div style='margin-top: 6px; margin-bottom: 4px; font-size: 0.82rem; color: #94a3b8;'>💡 <b>Suggested Follow-ups:</b></div>", unsafe_allow_html=True)
-                    fu_cols = st.columns(min(len(msg_follow_ups), 3))
-                    for f_idx, follow_q in enumerate(msg_follow_ups[:3]):
-                        with fu_cols[f_idx]:
-                            if st.button(f"🔍 {follow_q}", key=f"btn_fu_{m_idx}_{f_idx}", help=f"Ask: {follow_q}", use_container_width=True):
-                                st.session_state.pending_query = {
-                                    "text_prompt": follow_q,
-                                    "selected_point": None,
-                                    "bounding_box": None,
-                                }
-                                st.session_state.messages.append({
-                                    "role": "user",
-                                    "content": follow_q
-                                })
-                                st.rerun()
-
-    # Option 3: Compact docked contextual payload pill (directly above chat input)
-    if st.session_state.get("selected_points"):
-        is_bbox = st.session_state.get("bounding_box") is not None
-        if is_bbox:
-            b_ll, b_ur = st.session_state.bounding_box
-            badge_html = (
-                f"<div class='geo-docked-pill geo-docked-pill-stacked' title='Bounding Box AOI: Lower-Left ({b_ll[0]:.4f}°, {b_ll[1]:.4f}°) | Upper-Right ({b_ur[0]:.4f}°, {b_ur[1]:.4f}°)'>"
-                f"<span class='geo-pill-icon'>📦</span>"
-                f"<div class='geo-pill-stack'>"
-                f"<div class='geo-pill-row'><span class='geo-pill-sublabel'>SW:</span><span class='geo-pill-coord'>{b_ll[0]:.4f}°, {b_ll[1]:.4f}°</span></div>"
-                f"<div class='geo-pill-row'><span class='geo-pill-sublabel'>NE:</span><span class='geo-pill-coord'>{b_ur[0]:.4f}°, {b_ur[1]:.4f}°</span></div>"
-                f"</div>"
-                f"</div>"
-            )
-            clear_btn_label = "❌ Clear"
-            recon_btn_label = "🔍 Recon"
-        else:
-            plat, plng = st.session_state.selected_points[0]
-            badge_html = (
-                f"<div class='geo-docked-pill' title='Attached Tactical Target: ({plat:.4f}°, {plng:.4f}°)'>"
-                f"<span class='geo-pill-icon'>📍</span>"
-                f"<span class='geo-pill-label'>TARGET:</span>"
-                f"<span class='geo-pill-coord'>({plat:.4f}°, {plng:.4f}°)</span>"
-                f"</div>"
-            )
-            clear_btn_label = "❌ Clear"
-            recon_btn_label = "🔍 Recon"
-
-        col_pill, col_clr, col_rec = st.columns([5.2, 2.1, 2.7])
-        with col_pill:
-            st.markdown(badge_html, unsafe_allow_html=True)
-        with col_clr:
-            if st.button(clear_btn_label, key="clear_chat_pts", use_container_width=True, help="Clear active spatial selection"):
-                clear_spatial_selection()
-                st.rerun()
-        with col_rec:
-            if st.button(recon_btn_label, key="run_chat_recon", use_container_width=True, help="Run instant reconnaissance scan"):
-                active_pt = None if is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
-                active_bbox = st.session_state.get("bounding_box") if is_bbox else None
-
-                recon_resp = dispatch_geo_query(
-                    text_prompt=None,
-                    selected_point=active_pt,
-                    bounding_box=active_bbox
-                )
-                if recon_resp:
-                    if is_bbox and st.session_state.get("bounding_box"):
-                        b_ll, b_ur = st.session_state.bounding_box
-                        user_msg = f"Reconnaissance requested for bounding box: Lower-Left ({b_ll[0]:.4f}°, {b_ll[1]:.4f}°), Upper-Right ({b_ur[0]:.4f}°, {b_ur[1]:.4f}°)"
-                    else:
-                        plat, plng = st.session_state.selected_points[0]
-                        user_msg = f"Reconnaissance requested for coordinate: ({plat:.4f}°, {plng:.4f}°)"
-
-                    st.session_state.messages.append({"role": "user", "content": user_msg})
-                    st.session_state.messages.append(_build_assistant_message(recon_resp))
-                    st.session_state.map_layers.extend(recon_resp.layers)
-                    if is_bbox and st.session_state.get("bounding_box"):
-                        st.session_state.answered_bbox = st.session_state.bounding_box
-                    if getattr(recon_resp, "map_bbox", None):
-                        st.session_state.last_map_bbox = recon_resp.map_bbox
-                    if not st.session_state.get("keep_points", False):
-                        clear_spatial_selection()
-                    st.rerun()
-    else:
-        # Instant HUD container placeholder for 0ms client-side pre-rendering
-        st.markdown("<div id='geoai-instant-pill-slot' style='display: none;'></div>", unsafe_allow_html=True)
-
-    # Chat input box for user queries
-    user_prompt = st.chat_input("Type a question (e.g. 'What units are stationed here?')...")
-
-    if user_prompt:
-        # 1. Append user's message to chat history
-        st.session_state.messages.append({"role": "user", "content": user_prompt})
-
-        # 2. Immediately render user's question into chat_container so user sees it right away
-        with chat_container:
-            with st.chat_message("user", avatar=t_cfg["user_avatar"]):
-                st.markdown(f"<div class='chat-role-tag chat-role-operator'><span class='bubble-marker-operator'></span>{t_cfg['operator_tag']}</div>", unsafe_allow_html=True)
-                st.markdown(user_prompt)
-
-        # 3. Queue pending query in session state so component mount/sync reruns never drop it
-        is_bbox = st.session_state.get("bounding_box") is not None
-        active_pt = None if is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
-        active_bbox = st.session_state.get("bounding_box") if is_bbox else None
-        st.session_state.pending_query = {
-            "text_prompt": user_prompt,
-            "selected_point": active_pt,
-            "bounding_box": active_bbox,
-        }
-
-
-# ------------------------------------------------------------------------------
-# 6. Right Column: Folium Map Rendering & Click Interception
+# 5. Right Column (col2): Folium Map Rendering & Click Interception
+# Evaluated first so map selections update session_state BEFORE col1 renders,
+# eliminating the need for a secondary st.rerun() cascade (AGENTS.md Rule 1.1)
 # ------------------------------------------------------------------------------
 with col2:
     # Center coordinates of Ukraine: latitude ~48.3794, longitude ~31.1656
@@ -4188,7 +4020,6 @@ with col2:
             if not has_selection and st.session_state.get("map_layers"):
                 st.session_state.map_layers = []
             st.session_state.last_drawing_time = time.time()
-            st.rerun()
 
     # Also detect when all_drawings becomes empty while a bounding box was drawn
     if (
@@ -4203,7 +4034,6 @@ with col2:
         if not has_selection and st.session_state.get("map_layers"):
             st.session_state.map_layers = []
         st.session_state.last_drawing_time = time.time()
-        st.rerun()
 
     # Process newly drawn shape (Rectangle or Marker) only when no chat query is in flight
     if (
@@ -4242,8 +4072,6 @@ with col2:
             if map_data and map_data.get("last_clicked"):
                 cd = map_data["last_clicked"]
                 st.session_state.last_clicked = (round(cd["lat"], 5), round(cd["lng"], 5))
-            if needs_rerun:
-                st.rerun()
 
         elif gtype == "Point" and coords and len(coords) >= 2:
             st.session_state.last_processed_drawing = active_drawing
@@ -4252,7 +4080,6 @@ with col2:
             lat = round(float(coords[1]), 5)
             lng = round(float(coords[0]), 5)
             pt = (lat, lng)
-            needs_rerun = st.session_state.selected_points != [pt]
             st.session_state.selection_mode = "Point Selection"
             st.session_state.selected_points = [pt]
             st.session_state.bounding_box = None
@@ -4261,8 +4088,6 @@ with col2:
             st.session_state.last_drawing_time = time.time()
             if map_data and map_data.get("last_clicked"):
                 st.session_state.last_clicked = pt
-            if needs_rerun:
-                st.rerun()
 
     # --------------------------------------------------------------------------
     # 2. Click Interception (Selection ONLY - NO immediate backend call)
@@ -4289,7 +4114,235 @@ with col2:
                 st.session_state.bounding_box = None
                 st.session_state.answered_bbox = None
                 st.session_state.active_point = clicked_coord
+
+
+# ------------------------------------------------------------------------------
+# 6. Left Column (col1): Chat Interface & Docked Target Pill
+# Evaluated second: reads the fresh selected_points and renders the docked HUD
+# in this exact execution cycle without requiring a second st.rerun().
+# ------------------------------------------------------------------------------
+with col1:
+    # Render conversational message history inside a dedicated scroll container with its own scrollbar
+    # Stable container height prevents chat scroll area and input box from bouncing (AGENTS.md Rule 3.1)
+    chat_container_height = 465
+    chat_container = st.container(height=chat_container_height)
+    with chat_container:
+        for m_idx, msg in enumerate(st.session_state.messages):
+            role = msg["role"]
+            is_user = (role == "user")
+            avatar = t_cfg["user_avatar"] if is_user else t_cfg["ai_avatar"]
+            role_tag = t_cfg["operator_tag"] if is_user else t_cfg["ai_tag"]
+            if role == "assistant" and msg.get("is_live"):
+                role_tag += " • [LIVE RAG]"
+                if msg.get("grounded") is False:
+                    role_tag += " • [LLM ONLY]"
+
+            role_class = "chat-role-operator" if is_user else "chat-role-geoai"
+            marker_class = "bubble-marker-operator" if is_user else "bubble-marker-geoai"
+
+            with st.chat_message(role, avatar=avatar):
+                st.markdown(f"<div class='chat-role-tag {role_class}'><span class='{marker_class}'></span>{role_tag}</div>", unsafe_allow_html=True)
+                if role == "assistant" and not st.session_state.get("show_citations", True):
+                    st.markdown(msg.get("content_plain") or msg["content"])
+                else:
+                    st.markdown(msg["content"])
+
+                # Source Evidence Inspection Drawer
+                msg_sources = msg.get("sources", [])
+                msg_citations = {
+                    c.get("pointer"): c
+                    for c in msg.get("citations", [])
+                    if isinstance(c, dict) and c.get("pointer")
+                }
+                if msg_sources:
+                    with st.expander(f"📑 Verified Sources ({len(msg_sources)})", expanded=False):
+                        source_items_html = []
+                        for s_idx, src_doc in enumerate(msg_sources):
+                            cit_meta = msg_citations.get(src_doc, {})
+                            cit_id = cit_meta.get("id")
+                            cit_article = cit_meta.get("article")
+                            cit_section = cit_meta.get("section")
+                            cached_meta = st.session_state.get(f"src_meta_{m_idx}_{s_idx}", {})
+                            disp_article = _clean_doc_title(cit_article or cached_meta.get("document"))
+                            disp_section = _clean_doc_title(cit_section or cached_meta.get("section"))
+
+                            # Resolve document title and text from local graph if available
+                            passage = cached_meta or get_source_text(src_doc)
+                            if passage and isinstance(passage, dict):
+                                st.session_state[f"src_meta_{m_idx}_{s_idx}"] = passage
+                                if not disp_article:
+                                    disp_article = _clean_doc_title(passage.get("document"))
+                                if not disp_section:
+                                    disp_section = _clean_doc_title(passage.get("section"))
+                            else:
+                                st.session_state[f"src_meta_{m_idx}_{s_idx}"] = {"document": "", "section": ""}
+
+                            if cit_id and disp_article:
+                                title_str = f"[{cit_id}] {disp_article}"
+                            elif disp_article and disp_article != src_doc:
+                                title_str = disp_article
+                            else:
+                                title_str = f"Source Document #{s_idx + 1}"
+
+                            sec_str = f" — <i>{disp_section}</i>" if disp_section else ""
+
+                            if passage and passage.get("text"):
+                                doc_name = _clean_doc_title(passage.get("document") or cit_article or f"Document #{s_idx + 1}")
+                                sec_name = _clean_doc_title(passage.get("section") or cit_section)
+                                para_num = passage.get("paragraph_index")
+                                header_parts = [f"<b>{doc_name}</b>"]
+                                if sec_name:
+                                    header_parts.append(f"Section: <i>{sec_name}</i>")
+                                if para_num is not None:
+                                    header_parts.append(f"Paragraph #{para_num + 1}")
+                                header_str = " | ".join(header_parts)
+                                raw_text = passage["text"]
+                                spans = cit_meta.get("text_spans") or cit_meta.get("char_offsets") or passage.get("text_spans") or []
+                                highlighted_text = _highlight_text_spans(raw_text, spans)
+                                body_html = (
+                                    f"<div style='background: rgba(14, 22, 32, 0.7); border-left: 3px solid #00e5ff; padding: 10px 14px; border-radius: 4px; font-size: 0.9em; margin-top: 8px; margin-bottom: 4px; line-height: 1.5;'>"
+                                    f"<div style='font-weight: 600; margin-bottom: 6px; color: #38bdf8;'>{header_str}</div>"
+                                    f"<div style='color: #cbd5e1;'>{highlighted_text}</div>"
+                                    f"</div>"
+                                )
+                            else:
+                                body_html = (
+                                    f"<div style='background: rgba(14, 22, 32, 0.7); border-left: 3px solid #64748b; padding: 10px 14px; border-radius: 4px; font-size: 0.88em; margin-top: 8px; margin-bottom: 4px; color: #94a3b8;'>"
+                                    f"<div style='font-weight: 600; margin-bottom: 4px; color: #cbd5e1;'>Notice</div>"
+                                    f"<div>(No inline corpus text available for this reference)</div>"
+                                    f"</div>"
+                                )
+
+                            source_items_html.append(
+                                f"<details class='geoai-source-detail'>"
+                                f"<summary class='geoai-source-summary'>"
+                                f"<span class='geoai-source-title'>📄 <b>{title_str}</b>{sec_str}</span>"
+                                f"<span class='geoai-source-badge'>Inspect ▾</span>"
+                                f"</summary>"
+                                f"{body_html}"
+                                f"</details>"
+                            )
+
+                        st.markdown("".join(source_items_html), unsafe_allow_html=True)
+
+                # Upgrade 5: Regional Distribution Breakdown
+                msg_regions = msg.get("regions", {})
+                if role == "assistant" and msg_regions and isinstance(msg_regions, dict):
+                    with st.expander(f"🌍 Regional Distribution ({len(msg_regions)} regions)", expanded=False):
+                        for reg_name, count in sorted(msg_regions.items(), key=lambda x: str(x[0])):
+                            st.markdown(f"- **{reg_name}**: `{count}` places/events")
+
+                # Upgrade 4: Follow-up Suggestions & Did-You-Mean
+                if role == "assistant" and msg.get("did_you_mean"):
+                    st.info(f"💡 *Did you mean:* **{msg['did_you_mean']}**?")
+
+                msg_follow_ups = msg.get("follow_ups", [])
+                if role == "assistant" and msg_follow_ups and m_idx == len(st.session_state.messages) - 1:
+                    st.markdown("<div style='margin-top: 6px; margin-bottom: 4px; font-size: 0.82rem; color: #94a3b8;'>💡 <b>Suggested Follow-ups:</b></div>", unsafe_allow_html=True)
+                    fu_cols = st.columns(min(len(msg_follow_ups), 3))
+                    for f_idx, follow_q in enumerate(msg_follow_ups[:3]):
+                        with fu_cols[f_idx]:
+                            if st.button(f"🔍 {follow_q}", key=f"btn_fu_{m_idx}_{f_idx}", help=f"Ask: {follow_q}", use_container_width=True):
+                                st.session_state.pending_query = {
+                                    "text_prompt": follow_q,
+                                    "selected_point": None,
+                                    "bounding_box": None,
+                                }
+                                st.session_state.messages.append({
+                                    "role": "user",
+                                    "content": follow_q
+                                })
+                                st.rerun()
+
+    # Option 3: Compact docked contextual payload pill (directly above chat input)
+    if st.session_state.get("selected_points"):
+        is_bbox = st.session_state.get("bounding_box") is not None
+        if is_bbox:
+            b_ll, b_ur = st.session_state.bounding_box
+            badge_html = (
+                f"<div class='geo-docked-pill geo-docked-pill-stacked' title='Bounding Box AOI: Lower-Left ({b_ll[0]:.4f}°, {b_ll[1]:.4f}°) | Upper-Right ({b_ur[0]:.4f}°, {b_ur[1]:.4f}°)'>"
+                f"<span class='geo-pill-icon'>📦</span>"
+                f"<div class='geo-pill-stack'>"
+                f"<div class='geo-pill-row'><span class='geo-pill-sublabel'>SW:</span><span class='geo-pill-coord'>{b_ll[0]:.4f}°, {b_ll[1]:.4f}°</span></div>"
+                f"<div class='geo-pill-row'><span class='geo-pill-sublabel'>NE:</span><span class='geo-pill-coord'>{b_ur[0]:.4f}°, {b_ur[1]:.4f}°</span></div>"
+                f"</div>"
+                f"</div>"
+            )
+            clear_btn_label = "❌ Clear"
+            recon_btn_label = "🔍 Recon"
+        else:
+            plat, plng = st.session_state.selected_points[0]
+            badge_html = (
+                f"<div class='geo-docked-pill' title='Attached Tactical Target: ({plat:.4f}°, {plng:.4f}°)'>"
+                f"<span class='geo-pill-icon'>📍</span>"
+                f"<span class='geo-pill-label'>TARGET:</span>"
+                f"<span class='geo-pill-coord'>({plat:.4f}°, {plng:.4f}°)</span>"
+                f"</div>"
+            )
+            clear_btn_label = "❌ Clear"
+            recon_btn_label = "🔍 Recon"
+
+        col_pill, col_clr, col_rec = st.columns([5.2, 2.1, 2.7])
+        with col_pill:
+            st.markdown(badge_html, unsafe_allow_html=True)
+        with col_clr:
+            if st.button(clear_btn_label, key="clear_chat_pts", use_container_width=True, help="Clear active spatial selection"):
+                clear_spatial_selection()
                 st.rerun()
+        with col_rec:
+            if st.button(recon_btn_label, key="run_chat_recon", use_container_width=True, help="Run instant reconnaissance scan"):
+                active_pt = None if is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
+                active_bbox = st.session_state.get("bounding_box") if is_bbox else None
+
+                recon_resp = dispatch_geo_query(
+                    text_prompt=None,
+                    selected_point=active_pt,
+                    bounding_box=active_bbox
+                )
+                if recon_resp:
+                    if is_bbox and st.session_state.get("bounding_box"):
+                        b_ll, b_ur = st.session_state.bounding_box
+                        user_msg = f"Reconnaissance requested for bounding box: Lower-Left ({b_ll[0]:.4f}°, {b_ll[1]:.4f}°), Upper-Right ({b_ur[0]:.4f}°, {b_ur[1]:.4f}°)"
+                    else:
+                        plat, plng = st.session_state.selected_points[0]
+                        user_msg = f"Reconnaissance requested for coordinate: ({plat:.4f}°, {plng:.4f}°)"
+
+                    st.session_state.messages.append({"role": "user", "content": user_msg})
+                    st.session_state.messages.append(_build_assistant_message(recon_resp))
+                    st.session_state.map_layers.extend(recon_resp.layers)
+                    if is_bbox and st.session_state.get("bounding_box"):
+                        st.session_state.answered_bbox = st.session_state.bounding_box
+                    if getattr(recon_resp, "map_bbox", None):
+                        st.session_state.last_map_bbox = recon_resp.map_bbox
+                    if not st.session_state.get("keep_points", False):
+                        clear_spatial_selection()
+                    st.rerun()
+    else:
+        # Instant HUD container placeholder for 0ms client-side pre-rendering
+        st.markdown("<div id='geoai-instant-pill-slot' style='display: none;'></div>", unsafe_allow_html=True)
+
+    # Chat input box for user queries
+    user_prompt = st.chat_input("Type a question (e.g. 'What units are stationed here?')...")
+
+    if user_prompt:
+        # 1. Append user's message to chat history
+        st.session_state.messages.append({"role": "user", "content": user_prompt})
+
+        # 2. Immediately render user's question into chat_container so user sees it right away
+        with chat_container:
+            with st.chat_message("user", avatar=t_cfg["user_avatar"]):
+                st.markdown(f"<div class='chat-role-tag chat-role-operator'><span class='bubble-marker-operator'></span>{t_cfg['operator_tag']}</div>", unsafe_allow_html=True)
+                st.markdown(user_prompt)
+
+        # 3. Queue pending query in session state so component mount/sync reruns never drop it
+        is_bbox = st.session_state.get("bounding_box") is not None
+        active_pt = None if is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
+        active_bbox = st.session_state.get("bounding_box") if is_bbox else None
+        st.session_state.pending_query = {
+            "text_prompt": user_prompt,
+            "selected_point": active_pt,
+            "bounding_box": active_bbox,
+        }
 
 
 # ------------------------------------------------------------------------------

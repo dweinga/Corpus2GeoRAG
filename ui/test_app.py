@@ -1588,3 +1588,25 @@ class TestTacticalHudSymbologyAndAnsweredBbox:
         assert st.session_state.selection_clear_seq == 1
         assert st.session_state.last_clicked == (50.45, 30.52)
         assert st.session_state.ignored_drawing is not None
+
+    def test_pipeline_inversion_and_zero_rerun_dispatch(self):
+        """Verify pipeline inversion (col2 before col1) and immediate dispatch in code."""
+        with open("app.py", "r", encoding="utf-8") as f:
+            code = f.read()
+
+        # 1. col2 (map) must be evaluated before col1 (chat)
+        col2_pos = code.find("with col2:")
+        col1_pos = code.find("with col1:")
+        assert col2_pos != -1 and col1_pos != -1
+        assert col2_pos < col1_pos, "Pipeline Inversion: with col2: must execute before with col1:"
+
+        # 2. Immediate dispatch helper must be defined
+        assert "window.geoaiImmediateDispatch" in code
+        assert "_peek_incoming_map_state" in code
+
+        # 3. col2 click and drawing handlers must not trigger st.rerun cascades
+        col2_code = code[col2_pos:col1_pos]
+        assert "st.session_state.selected_points = [clicked_coord]" in col2_code
+        click_idx = col2_code.find("st.session_state.selected_points = [clicked_coord]")
+        post_click = col2_code[click_idx:click_idx + 250]
+        assert "st.rerun()" not in post_click
