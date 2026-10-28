@@ -786,6 +786,19 @@ class MapTrashBinHook(MacroElement):
                 map.getContainer().classList.add('geoai-map-dark');
             }
 
+            // Auto-fit & window resize listener for Leaflet map tiles
+            try {
+                if (window.ResizeObserver && map.getContainer()) {
+                    var _mapRo = new ResizeObserver(function() {
+                        map.invalidateSize();
+                    });
+                    _mapRo.observe(map.getContainer());
+                }
+            } catch(e) {}
+            window.addEventListener('resize', function() {
+                try { map.invalidateSize(); } catch(e) {}
+            });
+
             // Instant 0ms Component Value Dispatch to bypass streamlit-folium's 250ms artificial debounce
             window.geoaiImmediateDispatch = function(mapInstance) {
                 try {
@@ -1917,16 +1930,43 @@ st.markdown(f"""
         padding: 0 !important;
     }}
 
+    /* Workspace Window Auto-Fit Architecture: always fit exactly inside screen/window */
     div[data-testid="stMainBlockContainer"],
     .main .block-container {{
         height: 100vh !important;
         max-height: 100vh !important;
         padding-top: 2.2rem !important;
-        padding-bottom: 0.3rem !important;
-        padding-left: 1rem !important;
-        padding-right: 1rem !important;
+        padding-bottom: 0.4rem !important;
+        padding-left: 0.75rem !important;
+        padding-right: 0.75rem !important;
         max-width: 100% !important;
         box-sizing: border-box !important;
+        overflow: hidden !important;
+        display: flex !important;
+        flex-direction: column !important;
+    }}
+
+    /* Main vertical flow expands to 100% of available viewport space */
+    div[data-testid="stMainBlockContainer"] > div[data-testid="stVerticalBlock"] {{
+        flex: 1 1 0px !important;
+        display: flex !important;
+        flex-direction: column !important;
+        height: calc(100vh - 2.6rem) !important;
+        max-height: calc(100vh - 2.6rem) !important;
+        min-height: 0 !important;
+        overflow: hidden !important;
+        gap: 0 !important;
+    }}
+
+    /* Zero out height for non-visual markdown, style, and script wrappers */
+    div[data-testid="stMainBlockContainer"] > div[data-testid="stVerticalBlock"] > div[data-testid="stElementContainer"]:has(div[data-testid="stMarkdownContainer"] > style),
+    div[data-testid="stMainBlockContainer"] > div[data-testid="stVerticalBlock"] > div[data-testid="stElementContainer"]:has(div[data-testid="stMarkdownContainer"] > script) {{
+        margin: 0 !important;
+        padding: 0 !important;
+        height: 0 !important;
+        min-height: 0 !important;
+        max-height: 0 !important;
+        line-height: 0 !important;
         overflow: hidden !important;
     }}
 
@@ -1975,8 +2015,88 @@ st.markdown(f"""
         min-height: 38px !important;
         max-height: 38px !important;
         margin-top: 2px !important;
-        margin-bottom: 6px !important;
+        margin-bottom: 4px !important;
         border-radius: 4px !important;
+    }}
+
+    div[data-testid="stElementContainer"]:has(iframe[title="streamlit_adjustable_columns.streamlit_adjustable_columns"]) {{
+        flex: 0 0 auto !important;
+        margin-bottom: 4px !important;
+    }}
+
+    /* Split-screen horizontal block (Chat + Map) auto-fits exactly to the remaining window height */
+    div[data-testid="stMainBlockContainer"] div[data-testid="stHorizontalBlock"] {{
+        flex: 1 1 0px !important;
+        height: calc(100% - 44px) !important;
+        min-height: 0 !important;
+        max-height: 100% !important;
+        display: flex !important;
+        flex-direction: row !important;
+        overflow: hidden !important;
+        gap: 0.5rem !important;
+    }}
+
+    /* Both columns stretch to 100% height of the horizontal block */
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {{
+        height: 100% !important;
+        max-height: 100% !important;
+        min-height: 0 !important;
+        display: flex !important;
+        flex-direction: column !important;
+        overflow: hidden !important;
+    }}
+
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"] > div[data-testid="stVerticalBlock"] {{
+        height: 100% !important;
+        max-height: 100% !important;
+        min-height: 0 !important;
+        display: flex !important;
+        flex-direction: column !important;
+        overflow: hidden !important;
+        gap: 0.35rem !important;
+    }}
+
+    /* Map Column (col2): Stretches automatically to fill the exact window height */
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:last-child div[data-testid="stElementContainer"]:has(iframe),
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:last-child div[data-testid="stCustomComponentV1"],
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:last-child iframe {{
+        flex: 1 1 0px !important;
+        height: 100% !important;
+        max-height: 100% !important;
+        min-height: 100% !important;
+        width: 100% !important;
+        border: none !important;
+        border-radius: 4px !important;
+    }}
+
+    /* Chat Column (col1): Messages container expands to fill remaining height */
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child div[data-testid="stElementContainer"]:has(div[data-testid="stVerticalBlockBorderWrapper"]),
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child div[data-testid="stVerticalBlockBorderWrapper"] {{
+        flex: 1 1 0px !important;
+        height: 100% !important;
+        max-height: 100% !important;
+        min-height: 0 !important;
+        overflow: hidden !important;
+        display: flex !important;
+        flex-direction: column !important;
+    }}
+
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child div[data-testid="stVerticalBlockBorderWrapper"] > div[data-testid="stVerticalBlock"] {{
+        flex: 1 1 auto !important;
+        height: 100% !important;
+        max-height: 100% !important;
+        min-height: 0 !important;
+        overflow-y: auto !important;
+        overflow-x: hidden !important;
+        padding-right: 6px !important;
+    }}
+
+    /* Bottom HUD controls and chat input stay anchored at the bottom */
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child div[data-testid="stElementContainer"]:has(div[data-testid="stChatInput"]),
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child div[data-testid="stElementContainer"]:has(.geo-docked-pill),
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child div[data-testid="stElementContainer"]:has(#geoai-instant-pill-slot),
+    div[data-testid="stHorizontalBlock"] > div[data-testid="column"]:first-child div[data-testid="stChatInput"] {{
+        flex: 0 0 auto !important;
     }}
 
     /* Independent vertical scrolling for sidebar controls */
@@ -2530,6 +2650,63 @@ st.markdown("""
             slot.style.display = 'block';
         }
     });
+
+    // Auto-fit Chat & Map Workspace to exact screen/window dimensions
+    function autoFitWorkspace() {
+        try {
+            var cols = document.querySelector('div[data-testid="stMainBlockContainer"] div[data-testid="stHorizontalBlock"]');
+            if (!cols) return;
+
+            var rect = cols.getBoundingClientRect();
+            var availHeight = window.innerHeight - rect.top - 12; // 12px bottom safety buffer
+            if (availHeight < 250) availHeight = 250;
+
+            cols.style.setProperty('height', availHeight + 'px', 'important');
+            cols.style.setProperty('max-height', availHeight + 'px', 'important');
+
+            // 1. Right Column: Map iframe exact fit
+            var mapCol = cols.querySelector('div[data-testid="column"]:last-child');
+            if (mapCol) {
+                var mapIframes = mapCol.querySelectorAll('iframe');
+                for (var i = 0; i < mapIframes.length; i++) {
+                    mapIframes[i].style.setProperty('height', availHeight + 'px', 'important');
+                    mapIframes[i].style.setProperty('max-height', availHeight + 'px', 'important');
+                    var p = mapIframes[i].closest('div[data-testid="stCustomComponentV1"]') || mapIframes[i].parentElement;
+                    if (p) {
+                        p.style.setProperty('height', availHeight + 'px', 'important');
+                        p.style.setProperty('max-height', availHeight + 'px', 'important');
+                    }
+                }
+            }
+
+            // 2. Left Column: Chat scroll container exact fit
+            var chatCol = cols.querySelector('div[data-testid="column"]:first-child');
+            if (chatCol) {
+                var chatInput = chatCol.querySelector('div[data-testid="stChatInput"]');
+                var bottomOffset = (chatInput ? chatInput.offsetHeight : 50) + 20;
+                var pill = chatCol.querySelector('.geo-docked-pill');
+                if (pill) bottomOffset += 44;
+
+                var chatHeight = availHeight - bottomOffset;
+                if (chatHeight < 150) chatHeight = 150;
+
+                var chatWrapper = chatCol.querySelector('div[data-testid="stVerticalBlockBorderWrapper"]');
+                if (chatWrapper) {
+                    chatWrapper.style.setProperty('height', chatHeight + 'px', 'important');
+                    chatWrapper.style.setProperty('max-height', chatHeight + 'px', 'important');
+                }
+            }
+        } catch(e) {}
+    }
+
+    window.addEventListener('resize', autoFitWorkspace);
+    if (window.ResizeObserver) {
+        var _roW = new ResizeObserver(autoFitWorkspace);
+        _roW.observe(document.body);
+    }
+    setTimeout(autoFitWorkspace, 50);
+    setTimeout(autoFitWorkspace, 250);
+    setTimeout(autoFitWorkspace, 700);
 })();
 </script>
 """, unsafe_allow_html=True)

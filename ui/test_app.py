@@ -1610,3 +1610,24 @@ class TestTacticalHudSymbologyAndAnsweredBbox:
         click_idx = col2_code.find("st.session_state.selected_points = [clicked_coord]")
         post_click = col2_code[click_idx:click_idx + 250]
         assert "st.rerun()" not in post_click
+
+    def test_workspace_window_auto_fit_layout_and_listeners(self):
+        """Verify chat and map workspace automatically fit to the screen/window dimensions."""
+        with open("app.py", "r", encoding="utf-8") as f:
+            code = f.read()
+
+        # 1. CSS Auto-Fit rules for full-height split screen layout
+        assert "Workspace Window Auto-Fit Architecture" in code
+        assert 'div[data-testid="stHorizontalBlock"]' in code
+        assert "height: calc(100% - 44px) !important;" in code
+        assert 'div[data-testid="column"]:last-child div[data-testid="stCustomComponentV1"]' in code
+        assert 'div[data-testid="column"]:first-child div[data-testid="stVerticalBlockBorderWrapper"]' in code
+
+        # 2. Dynamic client-side JavaScript resize hook
+        assert "function autoFitWorkspace()" in code
+        assert "window.addEventListener('resize', autoFitWorkspace);" in code
+        assert "var _roW = new ResizeObserver(autoFitWorkspace);" in code
+
+        # 3. Leaflet map ResizeObserver to invalidate tile size on container resizing
+        assert "map.invalidateSize()" in code
+
