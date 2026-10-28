@@ -2081,27 +2081,29 @@ st.markdown(f"""
     [data-testid="stAppViewContainer"] {{
         height: 100vh !important;
         max-height: 100vh !important;
-        overflow: hidden !important;
+        overflow-x: hidden !important;
+        overflow-y: auto !important;
     }}
 
     section[data-testid="stMain"] {{
         height: 100vh !important;
         max-height: 100vh !important;
-        overflow: hidden !important;
+        overflow-x: hidden !important;
+        overflow-y: auto !important;
         padding: 0 !important;
     }}
 
     div[data-testid="stMainBlockContainer"],
     .main .block-container {{
-        height: 100vh !important;
-        max-height: 100vh !important;
+        min-height: 100vh !important;
         padding-top: 2.2rem !important;
         padding-bottom: 0.3rem !important;
         padding-left: 0.75rem !important;
         padding-right: 0.75rem !important;
         max-width: 100% !important;
         box-sizing: border-box !important;
-        overflow: hidden !important;
+        overflow-x: hidden !important;
+        overflow-y: auto !important;
     }}
 
     /* Header & Side Ribbon (Sidebar Toggle Controls) */
@@ -4647,40 +4649,40 @@ with col1:
     # The active target/AOI HUD and its [✕ Clear] and [🔍 Recon] actions live on the Leaflet Map Canvas (col2).
     # The headless action triggers below remain in the Streamlit widget tree at zero height for
     # parent window command bridging and backwards compatibility, with zero vertical layout shift or taskbar clipping.
-    with st.container():
-        st.markdown(
-            """<style>
-            div[data-testid="stHorizontalBlock"]:has(#geoai-headless-anchor) {
-                display: none !important;
-                height: 0px !important;
-                max-height: 0px !important;
-                margin: 0px !important;
-                padding: 0px !important;
-                overflow: hidden !important;
+    st.markdown(
+        """<style>
+        .st-key-clear_chat_pts,
+        .st-key-run_chat_recon,
+        div[data-testid="stElementContainer"]:has(.st-key-clear_chat_pts),
+        div[data-testid="stElementContainer"]:has(.st-key-run_chat_recon),
+        div[data-testid="stElementContainer"]:has(button[key="clear_chat_pts"]),
+        div[data-testid="stElementContainer"]:has(button[key="run_chat_recon"]) {
+            display: none !important;
+            height: 0px !important;
+            max-height: 0px !important;
+            margin: 0px !important;
+            padding: 0px !important;
+            overflow: hidden !important;
+        }
+        </style>
+        <div id='geoai-instant-pill-slot' style='display: none;'></div>
+        """,
+        unsafe_allow_html=True
+    )
+    if st.button("❌ Clear", key="clear_chat_pts", help="Clear active spatial selection"):
+        clear_spatial_selection()
+        st.rerun()
+    if st.button("🔍 Recon", key="run_chat_recon", help="Run instant reconnaissance scan"):
+        if not st.session_state.get("pending_query"):
+            is_bbox = st.session_state.get("bounding_box") is not None
+            active_pt = None if is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
+            active_bbox = st.session_state.get("bounding_box") if is_bbox else None
+            st.session_state.pending_query = {
+                "text_prompt": None,
+                "selected_point": active_pt,
+                "bounding_box": active_bbox,
+                "is_recon": True,
             }
-            </style>
-            <div id='geoai-instant-pill-slot' style='display: none;'></div>
-            """,
-            unsafe_allow_html=True
-        )
-        col_h1, col_h2 = st.columns(2)
-        with col_h1:
-            st.markdown("<div id='geoai-headless-anchor' style='display:none;'></div>", unsafe_allow_html=True)
-            if st.button("❌ Clear", key="clear_chat_pts", help="Clear active spatial selection"):
-                clear_spatial_selection()
-                st.rerun()
-        with col_h2:
-            if st.button("🔍 Recon", key="run_chat_recon", help="Run instant reconnaissance scan"):
-                if not st.session_state.get("pending_query"):
-                    is_bbox = st.session_state.get("bounding_box") is not None
-                    active_pt = None if is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
-                    active_bbox = st.session_state.get("bounding_box") if is_bbox else None
-                    st.session_state.pending_query = {
-                        "text_prompt": None,
-                        "selected_point": active_pt,
-                        "bounding_box": active_bbox,
-                        "is_recon": True,
-                    }
 
     # Chat input box for user queries
     user_prompt = st.chat_input("Type a question (e.g. 'What units are stationed here?')...", key="geoai_chat_input")

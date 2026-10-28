@@ -1715,8 +1715,8 @@ class TestOption1MapCanvasTacticalHudAndStableLayout:
         with open("app.py", "r", encoding="utf-8") as f:
             code = f.read()
 
-        assert "geoai-headless-anchor" in code
-        assert 'div[data-testid="stHorizontalBlock"]:has(#geoai-headless-anchor)' in code
+        assert ".st-key-clear_chat_pts" in code
+        assert ".st-key-run_chat_recon" in code
         assert 'display: none !important;' in code
         assert 'height: 0px !important;' in code
         assert 'key="clear_chat_pts"' in code
