@@ -2650,8 +2650,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # 0ms Instant Target HUD Bridge: listens to Leaflet map clicks/drawings in the iframe
-st.markdown("""<div id="geoai-instant-pill-slot" style="display: none;"></div>
-<script>
+st.markdown("""<script>
 (function() {
     if (window._geoaiSelectionBridgeInstalled) return;
     window._geoaiSelectionBridgeInstalled = true;
@@ -2817,6 +2816,7 @@ st.markdown("""<div id="geoai-instant-pill-slot" style="display: none;"></div>
     window.addEventListener('resize', forwardResizeToIframes);
 })();
 </script>
+<div id="geoai-instant-pill-slot" style="display: none;"></div>
 """, unsafe_allow_html=True)
 
 
