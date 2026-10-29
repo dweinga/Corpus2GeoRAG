@@ -1042,15 +1042,15 @@ class MapTrashBinHook(MacroElement):
                     } catch(err) {}
                 } else {
                     if (typeof window.updateMapTacticalHud === 'function') {
-                        if (state.activePoint) {
-                            window.updateMapTacticalHud({ type: 'point', lat: state.activePoint[0], lng: state.activePoint[1] });
-                        } else if (state.bboxBounds) {
+                        if (state.bboxBounds) {
                             window.updateMapTacticalHud({ type: 'bbox', sw: state.bboxBounds[0], ne: state.bboxBounds[1] });
+                        } else if (state.activePoint) {
+                            window.updateMapTacticalHud({ type: 'point', lat: state.activePoint[0], lng: state.activePoint[1] });
                         }
-                    } else if (state.activePoint) {
-                        window._lastHudInfo = { type: 'point', lat: state.activePoint[0], lng: state.activePoint[1] };
                     } else if (state.bboxBounds) {
                         window._lastHudInfo = { type: 'bbox', sw: state.bboxBounds[0], ne: state.bboxBounds[1] };
+                    } else if (state.activePoint) {
+                        window._lastHudInfo = { type: 'point', lat: state.activePoint[0], lng: state.activePoint[1] };
                     }
                     if (state.isQuerying || (window._isClientQuerying && state.bboxState !== 'answered')) {
                         setTimeout(function() {
@@ -4265,7 +4265,7 @@ with col2:
         bbox_state=sync_bbox_state,
         is_querying=is_querying,
         bbox_bounds=sync_bbox_bounds,
-        active_point=st.session_state.get("selected_points")[0] if st.session_state.get("selected_points") else None,
+        active_point=None if st.session_state.get("bounding_box") else (st.session_state.get("selected_points")[0] if st.session_state.get("selected_points") else None),
         pin_shape=st.session_state.get("pin_shape", "Diamond"),
     ).add_to(selection_fg)
 

@@ -1751,5 +1751,40 @@ class TestOption1MapCanvasTacticalHudAndStableLayout:
         assert code.count('<div id="geoai-instant-pill-slot"') == 1
         assert "<div id='geoai-instant-pill-slot'" not in code
 
+    def test_bbox_hud_persistence_over_single_target(self):
+        """Verify BBox selection HUD maintains bbox type over single point target after Streamlit reload."""
+        import folium
+        from streamlit_folium import _get_map_string, _get_feature_group_string
+        import app
+
+        # 1. MapTrashBinHook must prioritize state.bboxBounds over state.activePoint
+        m = folium.Map()
+        app.MapTrashBinHook().add_to(m)
+        script = _get_map_string(m)
+
+        bbox_idx = script.find("if (state.bboxBounds)")
+        pt_idx = script.find("else if (state.activePoint)")
+        assert bbox_idx != -1 and pt_idx != -1
+        assert bbox_idx < pt_idx, "state.bboxBounds must be checked BEFORE state.activePoint"
+
+        # 2. When bbox is present, SelectionSyncHook serializes bboxBounds and activePoint is null
+        fg = folium.FeatureGroup(name="Selection", control=False)
+        app.SelectionSyncHook(
+            has_selection=True,
+            clear_seq=0,
+            bbox_state="selected",
+            bbox_bounds=[[48.1234, 31.5678], [49.1234, 32.5678]],
+            active_point=None,
+        ).add_to(fg)
+        fg_str = _get_feature_group_string(fg, m, 0)
+        assert "bboxBounds: [[48.1234, 31.5678], [49.1234, 32.5678]]" in fg_str
+        assert "activePoint: null" in fg_str
+
+        # 3. app.py must guard active_point passing when bounding_box is present
+        with open("app.py", "r", encoding="utf-8") as f:
+            code = f.read()
+        assert 'active_point=None if st.session_state.get("bounding_box") else' in code
+
+
 
 
