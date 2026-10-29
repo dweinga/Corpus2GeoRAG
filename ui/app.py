@@ -3137,7 +3137,7 @@ if _early_map_state and isinstance(_early_map_state, dict):
 
         if _is_recent_release:
             st.session_state.last_clicked = _c_pt
-        elif _c_pt != st.session_state.last_clicked or st.session_state.get("bounding_box") is not None:
+        elif _c_pt != st.session_state.last_clicked:
             st.session_state.last_clicked = _c_pt
             if st.session_state.selected_points != [_c_pt] or st.session_state.get("bounding_box") is not None:
                 st.session_state.selection_mode = "Point Selection"
@@ -4700,7 +4700,7 @@ with col2:
         # If a drawing just completed and click is on a corner, sync last_clicked so the release click is suppressed
         if is_recent_release:
             st.session_state.last_clicked = clicked_coord
-        elif clicked_coord != st.session_state.last_clicked or st.session_state.get("bounding_box") is not None:
+        elif clicked_coord != st.session_state.last_clicked:
             st.session_state.last_clicked = clicked_coord
 
             # Direct map click selects/replaces target point only if changed or transitioning from BBox

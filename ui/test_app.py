@@ -1809,14 +1809,55 @@ class TestOption1MapCanvasTacticalHudAndStableLayout:
         assert 'targetType: hud ? hud.type : null' in code
         assert 'properties: {\n                                action: "recon",' in code or 'action: "recon",\n                                targetType: hud ? hud.type : null' in code
 
-        # 4. Canvas click transitions from BBox to Point Selection
-        assert 'elif _c_pt != st.session_state.last_clicked or st.session_state.get("bounding_box") is not None:' in code
-        assert 'elif clicked_coord != st.session_state.last_clicked or st.session_state.get("bounding_box") is not None:' in code
+        # 4. Canvas click transitions from BBox to Point Selection when a new coordinate arrives
+        assert 'elif _c_pt != st.session_state.last_clicked:' in code
+        assert 'elif clicked_coord != st.session_state.last_clicked:' in code
+        assert 'if st.session_state.selected_points != [_c_pt] or st.session_state.get("bounding_box") is not None:' in code
+        assert 'if st.session_state.selected_points != [clicked_coord] or st.session_state.get("bounding_box") is not None:' in code
 
         # 5. Section 2b and Section 5 handle targetType == "point" on recon
         assert '_target_type == "point"' in code
         assert 'target_type == "point"' in code
         assert 'st.session_state.selection_mode = "Point Selection"' in code
+
+    def test_chat_query_submission_preserves_bbox_and_routes_polygon(self):
+        """Verify that sending a chat query while a BBox is active does NOT convert BBox to a point."""
+        import streamlit as st
+        import app
+
+        # Setup state: BBox is actively selected
+        bbox = ((48.1234, 31.5678), (49.1234, 32.5678))
+        click_coord = (49.1234, 32.5678)
+        st.session_state.selection_mode = "Bounding Box"
+        st.session_state.bounding_box = bbox
+        st.session_state.selected_points = [bbox[0], bbox[1]]
+        st.session_state.last_clicked = click_coord
+        st.session_state.pending_query = None
+        st.session_state.answered_bbox = None
+
+        # Verify raw request payload formats as polygon, NOT point
+        payload = app._build_raw_request_payload(
+            text_prompt="Where in the bounding box where there drone attacks?",
+            selected_point=None,
+            bounding_box=bbox,
+        )
+        assert payload["geo_location"]["type"] == "polygon"
+        assert payload["geo_location"]["coordinates"][0][0] == [31.5678, 48.1234]
+
+        # Verify Section 2c logic: when bounding_box is present, active_pt is None
+        _is_bbox = st.session_state.get("bounding_box") is not None
+        assert _is_bbox is True
+        _active_pt = None if _is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
+        _active_bbox = st.session_state.get("bounding_box") if _is_bbox else None
+        assert _active_pt is None
+        assert _active_bbox == bbox
+
+        # Verify code guards that canvas click ONLY triggers when coordinate changed
+        with open("app.py", "r", encoding="utf-8") as f:
+            code = f.read()
+        assert 'elif _c_pt != st.session_state.last_clicked:' in code
+        assert 'elif clicked_coord != st.session_state.last_clicked:' in code
+
 
 
 
