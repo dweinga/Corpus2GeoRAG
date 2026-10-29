@@ -107,6 +107,27 @@ from geo_agent import (
 get_source_text = getattr(geo_agent, "get_source_text", lambda pointer: None)
 AgentError = getattr(geo_agent, "AgentError", RuntimeError)
 
+def _is_drawing_corner_release(
+    coord: Tuple[float, float],
+    bbox: Optional[Tuple[Tuple[float, float], Tuple[float, float]]],
+    tolerance: float = 0.0005,
+) -> bool:
+    """Check if a clicked coordinate is the mouseup release on a corner of a freshly drawn BBox."""
+    if not bbox or len(bbox) != 2:
+        return False
+    sw, ne = bbox
+    corners = [
+        (sw[0], sw[1]),
+        (sw[0], ne[1]),
+        (ne[0], sw[1]),
+        (ne[0], ne[1]),
+    ]
+    return any(
+        abs(coord[0] - c[0]) < tolerance and abs(coord[1] - c[1]) < tolerance
+        for c in corners
+    )
+
+
 def _build_raw_request_payload(
     text_prompt: Optional[str] = None,
     selected_point: Optional[Tuple[float, float]] = None,
@@ -705,32 +726,50 @@ class MapTrashBinHook(MacroElement):
                             rets[r].classList.add('geoai-reticle--querying');
                         }
                     }
+                    // Guard: If current selection is a point target or caller passed null, pulse reticle and do NOT render bbox scanline!
+                    var hud = window._lastHudInfo;
+                    if (
+                        boundsOverride === null ||
+                        (hud && hud.type === 'point') ||
+                        window._instantTargetMarker ||
+                        (c && c.querySelector('.geoai-pin--target') && !boundsOverride)
+                    ) {
+                        window._lastKnownBboxBounds = null;
+                        return;
+                    }
+
                     var targetBounds = boundsOverride || null;
-                    function checkLayer(l) {
-                        if (!l) return;
-                        if (l.getBounds && l._path) {
-                            var cls = ((l.options && l.options.className) || '') + ' ' + (l._path.getAttribute('class') || '');
-                            if (cls.indexOf('geoai-bbox--selected') !== -1 || cls.indexOf('geoai-bbox--querying') !== -1) {
-                                l._path.classList.add('geoai-bbox--querying');
-                                if (!targetBounds) {
-                                    targetBounds = l.getBounds();
+                    if (!targetBounds && (!hud || hud.type === 'bbox')) {
+                        function checkLayer(l) {
+                            if (!l) return;
+                            if (l.getBounds && l._path) {
+                                var cls = ((l.options && l.options.className) || '') + ' ' + (l._path.getAttribute('class') || '');
+                                if (cls.indexOf('geoai-bbox--selected') !== -1 || cls.indexOf('geoai-bbox--querying') !== -1) {
+                                    l._path.classList.add('geoai-bbox--querying');
+                                    if (!targetBounds) {
+                                        targetBounds = l.getBounds();
+                                    }
                                 }
                             }
+                            if (l.eachLayer && typeof l.eachLayer === 'function') {
+                                try { l.eachLayer(checkLayer); } catch(err2) {}
+                            }
                         }
-                        if (l.eachLayer && typeof l.eachLayer === 'function') {
-                            try { l.eachLayer(checkLayer); } catch(err2) {}
-                        }
-                    }
-                    map.eachLayer(checkLayer);
+                        map.eachLayer(checkLayer);
 
-                    if (!targetBounds && window._instantBboxLayers && window._instantBboxLayers[0] && typeof window._instantBboxLayers[0].getBounds === 'function') {
-                        targetBounds = window._instantBboxLayers[0].getBounds();
+                        if (!targetBounds && window._instantBboxLayers && window._instantBboxLayers[0] && typeof window._instantBboxLayers[0].getBounds === 'function') {
+                            targetBounds = window._instantBboxLayers[0].getBounds();
+                        }
+                        if (!targetBounds && hud && hud.type === 'bbox' && window._lastKnownBboxBounds) {
+                            targetBounds = window._lastKnownBboxBounds;
+                        }
                     }
-                    if (!targetBounds && window._lastKnownBboxBounds) {
-                        targetBounds = window._lastKnownBboxBounds;
-                    }
+
                     if (targetBounds) {
                         window._lastKnownBboxBounds = targetBounds;
+                    } else {
+                        window._lastKnownBboxBounds = null;
+                        return;
                     }
 
                     if (targetBounds && typeof L.svgOverlay === 'function') {
@@ -915,6 +954,7 @@ class MapTrashBinHook(MacroElement):
             // Function to instantly remove any active selection from the map DOM (0ms latency)
             function clearPreviousSelectionInstantly() {
                 stopQueryingAnimation();
+                window._lastKnownBboxBounds = null;
 
                 // 1. Clear Leaflet Draw items & client-side instant previews
                 clearInstantPreviewOnly();
@@ -1021,6 +1061,8 @@ class MapTrashBinHook(MacroElement):
                 }
                 if (state.bboxBounds) {
                     window._lastKnownBboxBounds = state.bboxBounds;
+                } else {
+                    window._lastKnownBboxBounds = null;
                 }
                 // Always clear temporary client-side preview layers once selection_fg has mounted from Python
                 clearInstantPreviewOnly();
@@ -1144,6 +1186,8 @@ class MapTrashBinHook(MacroElement):
                 }
                 if (window.__GLOBAL_DATA__) {
                     window.__GLOBAL_DATA__.lat_lng_clicked = e.latlng;
+                    window.__GLOBAL_DATA__.last_active_drawing = null;
+                    window.__GLOBAL_DATA__.all_drawings = [];
                 }
                 try {
                     if (typeof window.geoaiImmediateDispatch === "function") {
@@ -1178,6 +1222,7 @@ class MapTrashBinHook(MacroElement):
                         }
 
                         if (!alreadyActive) {
+                            clearPreviousSelectionInstantly();
                             if (typeof window.updateMapTacticalHud === 'function') {
                                 window.updateMapTacticalHud({ type: 'point', lat: p_lat, lng: p_lng });
                             } else {
@@ -1249,6 +1294,8 @@ class MapTrashBinHook(MacroElement):
                     var swLng = Math.round(Math.min(rawSW.lng, rawNE.lng) * 100000) / 100000;
                     var neLat = Math.round(Math.max(rawSW.lat, rawNE.lat) * 100000) / 100000;
                     var neLng = Math.round(Math.max(rawSW.lng, rawNE.lng) * 100000) / 100000;
+                    // Immediately clear any prior selection (single point or previous box)
+                    clearPreviousSelectionInstantly();
                     window._lastKnownBboxBounds = [[swLat, swLng], [neLat, neLng]];
 
                     // Send 0ms instant selection event to parent window HUD
@@ -1260,9 +1307,6 @@ class MapTrashBinHook(MacroElement):
                             ne: [neLat, neLng]
                         }, '*');
                     } catch(err) {}
-
-                    // Immediately clear any prior selection (single point or previous box)
-                    clearPreviousSelectionInstantly();
 
                     if (typeof window.updateMapTacticalHud === 'function') {
                         window.updateMapTacticalHud({ type: 'bbox', sw: [swLat, swLng], ne: [neLat, neLng] });
@@ -1701,13 +1745,23 @@ class MapTrashBinHook(MacroElement):
                     reconBtn.addEventListener('click', function(ev) {
                         ev.preventDefault();
                         ev.stopPropagation();
-                        startQueryingAnimation();
+                        var hud = window._lastHudInfo;
+                        if (hud && hud.type === 'bbox') {
+                            startQueryingAnimation(hud.sw && hud.ne ? [hud.sw, hud.ne] : null);
+                        } else {
+                            startQueryingAnimation(null);
+                        }
 
                         var reconPayload = {
                             type: "Feature",
                             geometry: null,
                             properties: {
                                 action: "recon",
+                                targetType: hud ? hud.type : null,
+                                lat: (hud && hud.type === 'point') ? hud.lat : null,
+                                lng: (hud && hud.type === 'point') ? hud.lng : null,
+                                sw: (hud && hud.type === 'bbox') ? hud.sw : null,
+                                ne: (hud && hud.type === 'bbox') ? hud.ne : null,
                                 timestamp: Date.now()
                             }
                         };
@@ -1727,7 +1781,12 @@ class MapTrashBinHook(MacroElement):
                         try {
                             window.parent.postMessage({
                                 type: 'GEOAI_PARENT_CMD',
-                                action: 'trigger_recon'
+                                action: 'trigger_recon',
+                                targetType: hud ? hud.type : null,
+                                lat: (hud && hud.type === 'point') ? hud.lat : null,
+                                lng: (hud && hud.type === 'point') ? hud.lng : null,
+                                sw: (hud && hud.type === 'bbox') ? hud.sw : null,
+                                ne: (hud && hud.type === 'bbox') ? hud.ne : null
                             }, '*');
                         } catch(e) {}
                     });
@@ -2959,15 +3018,61 @@ if _early_map_state and isinstance(_early_map_state, dict):
         _geom = _early_drawing.get("geometry")
         if _props.get("action") == "recon" and _early_drawing != st.session_state.get("ignored_drawing"):
             st.session_state.ignored_drawing = _early_drawing
-            _is_bbox = st.session_state.get("bounding_box") is not None
-            _active_pt = None if _is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
-            _active_bbox = st.session_state.get("bounding_box") if _is_bbox else None
-            st.session_state.pending_query = {
-                "text_prompt": None,
-                "selected_point": _active_pt,
-                "bounding_box": _active_bbox,
-                "is_recon": True,
-            }
+            _target_type = _props.get("targetType")
+            if _target_type == "point":
+                _lat = _props.get("lat")
+                _lng = _props.get("lng")
+                if _lat is not None and _lng is not None:
+                    _pt = (round(float(_lat), 5), round(float(_lng), 5))
+                elif st.session_state.get("selected_points"):
+                    _pt = st.session_state.selected_points[0]
+                else:
+                    _pt = st.session_state.get("active_point")
+
+                st.session_state.selection_mode = "Point Selection"
+                st.session_state.selected_points = [_pt] if _pt else []
+                st.session_state.bounding_box = None
+                st.session_state.answered_bbox = None
+                st.session_state.active_point = _pt
+                st.session_state.pending_query = {
+                    "text_prompt": None,
+                    "selected_point": _pt,
+                    "bounding_box": None,
+                    "is_recon": True,
+                }
+            elif _target_type == "bbox":
+                _sw = _props.get("sw")
+                _ne = _props.get("ne")
+                if _sw is not None and _ne is not None:
+                    _bbox = (
+                        (round(float(_sw[0]), 5), round(float(_sw[1]), 5)),
+                        (round(float(_ne[0]), 5), round(float(_ne[1]), 5)),
+                    )
+                else:
+                    _bbox = st.session_state.get("bounding_box")
+
+                st.session_state.selection_mode = "Bounding Box"
+                if _bbox:
+                    st.session_state.selected_points = [_bbox[0], _bbox[1]]
+                    st.session_state.bounding_box = _bbox
+                    st.session_state.answered_bbox = None
+                    st.session_state.active_point = _bbox[1]
+                st.session_state.pending_query = {
+                    "text_prompt": None,
+                    "selected_point": None,
+                    "bounding_box": _bbox,
+                    "is_recon": True,
+                }
+            else:
+                _is_bbox = st.session_state.get("bounding_box") is not None
+                _active_pt = None if _is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
+                _active_bbox = st.session_state.get("bounding_box") if _is_bbox else None
+                st.session_state.pending_query = {
+                    "text_prompt": None,
+                    "selected_point": _active_pt,
+                    "bounding_box": _active_bbox,
+                    "is_recon": True,
+                }
         elif (_props.get("action") == "delete" or (not _geom and _props.get("action") != "recon")) and _early_drawing != st.session_state.get("ignored_drawing"):
             st.session_state.ignored_drawing = _early_drawing
             _has_sel = bool(st.session_state.get("selected_points") or st.session_state.get("bounding_box"))
@@ -2977,7 +3082,8 @@ if _early_map_state and isinstance(_early_map_state, dict):
             st.session_state.last_drawing_time = time.time()
 
     elif (
-        _early_all_drawings == []
+        not _early_clicked
+        and _early_all_drawings == []
         and st.session_state.get("selection_mode") == "Bounding Box"
         and st.session_state.get("bounding_box")
         and not _early_drawing
@@ -3025,12 +3131,15 @@ if _early_map_state and isinstance(_early_map_state, dict):
     # 3. Handle map canvas click
     elif _early_clicked and "lat" in _early_clicked and "lng" in _early_clicked:
         _c_pt = (round(_early_clicked["lat"], 5), round(_early_clicked["lng"], 5))
-        _is_recent = (time.time() - st.session_state.get("last_drawing_time", 0.0)) < 2.0
-        if _is_recent:
+        _draw_delta = time.time() - st.session_state.get("last_drawing_time", 0.0)
+        _is_corner = _is_drawing_corner_release(_c_pt, st.session_state.get("bounding_box"))
+        _is_recent_release = (_draw_delta < 0.35) and _is_corner
+
+        if _is_recent_release:
             st.session_state.last_clicked = _c_pt
-        elif _c_pt != st.session_state.last_clicked:
+        elif _c_pt != st.session_state.last_clicked or st.session_state.get("bounding_box") is not None:
             st.session_state.last_clicked = _c_pt
-            if st.session_state.selected_points != [_c_pt]:
+            if st.session_state.selected_points != [_c_pt] or st.session_state.get("bounding_box") is not None:
                 st.session_state.selection_mode = "Point Selection"
                 st.session_state.selected_points = [_c_pt]
                 st.session_state.bounding_box = None
@@ -4433,6 +4542,7 @@ with col2:
     # --------------------------------------------------------------------------
     active_drawing = map_data.get("last_active_drawing") if map_data else None
     all_drawings = map_data.get("all_drawings") if map_data else None
+    clicked_data = map_data.get("last_clicked") if map_data else None
 
     # Handle recon scan action or deletion events (trash bin icon clicked on map tools or shape deleted)
     if not st.session_state.get("pending_query") and active_drawing:
@@ -4440,15 +4550,61 @@ with col2:
         geom = active_drawing.get("geometry")
         if props.get("action") == "recon" and active_drawing != st.session_state.get("ignored_drawing"):
             st.session_state.ignored_drawing = active_drawing
-            is_bbox = st.session_state.get("bounding_box") is not None
-            active_pt = None if is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
-            active_bbox = st.session_state.get("bounding_box") if is_bbox else None
-            st.session_state.pending_query = {
-                "text_prompt": None,
-                "selected_point": active_pt,
-                "bounding_box": active_bbox,
-                "is_recon": True,
-            }
+            target_type = props.get("targetType")
+            if target_type == "point":
+                lat = props.get("lat")
+                lng = props.get("lng")
+                if lat is not None and lng is not None:
+                    pt = (round(float(lat), 5), round(float(lng), 5))
+                elif st.session_state.get("selected_points"):
+                    pt = st.session_state.selected_points[0]
+                else:
+                    pt = st.session_state.get("active_point")
+
+                st.session_state.selection_mode = "Point Selection"
+                st.session_state.selected_points = [pt] if pt else []
+                st.session_state.bounding_box = None
+                st.session_state.answered_bbox = None
+                st.session_state.active_point = pt
+                st.session_state.pending_query = {
+                    "text_prompt": None,
+                    "selected_point": pt,
+                    "bounding_box": None,
+                    "is_recon": True,
+                }
+            elif target_type == "bbox":
+                sw = props.get("sw")
+                ne = props.get("ne")
+                if sw is not None and ne is not None:
+                    bbox = (
+                        (round(float(sw[0]), 5), round(float(sw[1]), 5)),
+                        (round(float(ne[0]), 5), round(float(ne[1]), 5)),
+                    )
+                else:
+                    bbox = st.session_state.get("bounding_box")
+
+                st.session_state.selection_mode = "Bounding Box"
+                if bbox:
+                    st.session_state.selected_points = [bbox[0], bbox[1]]
+                    st.session_state.bounding_box = bbox
+                    st.session_state.answered_bbox = None
+                    st.session_state.active_point = bbox[1]
+                st.session_state.pending_query = {
+                    "text_prompt": None,
+                    "selected_point": None,
+                    "bounding_box": bbox,
+                    "is_recon": True,
+                }
+            else:
+                is_bbox = st.session_state.get("bounding_box") is not None
+                active_pt = None if is_bbox else (st.session_state.selected_points[0] if st.session_state.get("selected_points") else None)
+                active_bbox = st.session_state.get("bounding_box") if is_bbox else None
+                st.session_state.pending_query = {
+                    "text_prompt": None,
+                    "selected_point": active_pt,
+                    "bounding_box": active_bbox,
+                    "is_recon": True,
+                }
         elif (
             (props.get("action") == "delete" or (not geom and props.get("action") != "recon"))
             and active_drawing != st.session_state.get("ignored_drawing")
@@ -4463,6 +4619,7 @@ with col2:
     # Also detect when all_drawings becomes empty while a bounding box was drawn
     if (
         not st.session_state.get("pending_query")
+        and not clicked_data
         and all_drawings == []
         and st.session_state.get("selection_mode") == "Bounding Box"
         and st.session_state.get("bounding_box")
@@ -4533,21 +4690,21 @@ with col2:
     # --------------------------------------------------------------------------
     clicked_data = map_data.get("last_clicked") if map_data else None
 
-    # Check if a drawing was recently completed (within 2 seconds) to absorb mouseup
-    is_recent_drawing = (time.time() - st.session_state.get("last_drawing_time", 0.0)) < 2.0
-
     if not st.session_state.get("pending_query") and clicked_data and "lat" in clicked_data and "lng" in clicked_data:
         # Round coordinates to 5 decimal places (~1.1 meter precision)
         clicked_coord = (round(clicked_data["lat"], 5), round(clicked_data["lng"], 5))
+        draw_delta = time.time() - st.session_state.get("last_drawing_time", 0.0)
+        is_corner = _is_drawing_corner_release(clicked_coord, st.session_state.get("bounding_box"))
+        is_recent_release = (draw_delta < 0.35) and is_corner
 
-        # If a drawing just completed, sync last_clicked so the release click is suppressed
-        if is_recent_drawing:
+        # If a drawing just completed and click is on a corner, sync last_clicked so the release click is suppressed
+        if is_recent_release:
             st.session_state.last_clicked = clicked_coord
-        elif clicked_coord != st.session_state.last_clicked:
+        elif clicked_coord != st.session_state.last_clicked or st.session_state.get("bounding_box") is not None:
             st.session_state.last_clicked = clicked_coord
 
-            # Direct map click selects/replaces target point only if changed
-            if st.session_state.selected_points != [clicked_coord]:
+            # Direct map click selects/replaces target point only if changed or transitioning from BBox
+            if st.session_state.selected_points != [clicked_coord] or st.session_state.get("bounding_box") is not None:
                 st.session_state.selection_mode = "Point Selection"
                 st.session_state.selected_points = [clicked_coord]
                 st.session_state.bounding_box = None

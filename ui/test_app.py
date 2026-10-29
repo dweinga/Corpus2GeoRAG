@@ -1785,6 +1785,40 @@ class TestOption1MapCanvasTacticalHudAndStableLayout:
             code = f.read()
         assert 'active_point=None if st.session_state.get("bounding_box") else' in code
 
+    def test_point_selection_after_bbox_clears_scanline_and_bbox_state(self):
+        """Verify that selecting a point after drawing a BBox resets BBox bounds, suppresses scanline, and routes point recon."""
+        import app
+
+        # 1. Test _is_drawing_corner_release helper
+        bbox = ((48.0, 31.0), (49.0, 32.0))
+        assert app._is_drawing_corner_release((48.0, 31.0), bbox) is True
+        assert app._is_drawing_corner_release((48.0001, 31.0001), bbox) is True
+        assert app._is_drawing_corner_release((49.0, 32.0), bbox) is True
+        assert app._is_drawing_corner_release((48.5, 31.5), bbox) is False
+        assert app._is_drawing_corner_release((48.0, 31.0), None) is False
+
+        with open("app.py", "r", encoding="utf-8") as f:
+            code = f.read()
+
+        # 2. startQueryingAnimation guards against point target
+        assert "var hud = window._lastHudInfo;" in code
+        assert "hud.type === 'point'" in code
+        assert "window._lastKnownBboxBounds = null;" in code
+
+        # 3. Recon button in HUD passes targetType and coordinates
+        assert 'targetType: hud ? hud.type : null' in code
+        assert 'properties: {\n                                action: "recon",' in code or 'action: "recon",\n                                targetType: hud ? hud.type : null' in code
+
+        # 4. Canvas click transitions from BBox to Point Selection
+        assert 'elif _c_pt != st.session_state.last_clicked or st.session_state.get("bounding_box") is not None:' in code
+        assert 'elif clicked_coord != st.session_state.last_clicked or st.session_state.get("bounding_box") is not None:' in code
+
+        # 5. Section 2b and Section 5 handle targetType == "point" on recon
+        assert '_target_type == "point"' in code
+        assert 'target_type == "point"' in code
+        assert 'st.session_state.selection_mode = "Point Selection"' in code
+
+
 
 
 
